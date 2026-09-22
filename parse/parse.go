@@ -1,0 +1,935 @@
+// Copyright 2022 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package parse provides methods to parse datalog programs and parts thereof.
+package parse
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	antlr "github.com/antlr4-go/antlr/v4"
+	"codeberg.org/TauCeti/mangle-go/ast"
+	"codeberg.org/TauCeti/mangle-go/parse/gen"
+	"codeberg.org/TauCeti/mangle-go/symbols"
+)
+
+var (
+	packageSym   = ast.Atom{Predicate: symbols.Package}
+	useSym       = ast.Atom{Predicate: symbols.Use}
+	emptyPackage = ast.Decl{DeclaredAtom: packageSym, Descr: []ast.Atom{nameAtom("")}}
+
+	lexerPool *sync.Pool = &sync.Pool{
+		New: func() any {
+			l := gen.NewMangleLexer(nil)
+			l.RemoveErrorListeners()
+			return l
+		},
+	}
+	parserPool *sync.Pool = &sync.Pool{
+		New: func() any {
+			p := gen.NewMangleParser(nil)
+			p.RemoveErrorListeners()
+			return p
+		},
+	}
+)
+
+var _ gen.MangleVisitor = (*Parser)(nil)
+
+const commentStart = '#'
+
+// Parser represents an object that can be used for parsing.
+type Parser struct {
+	gen.BaseMangleVisitor
+	input  string
+	lexer  *gen.MangleLexer
+	parser *gen.MangleParser
+	errors *errorsList
+}
+
+// Holds errors.
+type errorsList struct {
+	errors []Error
+}
+
+func (e *errorsList) Add(msg string, line int, col int) {
+	e.errors = append(e.errors, Error{Message: msg, Line: line, Column: col})
+}
+
+func (p *Parser) init() error {
+	p.lexer = lexerPool.Get().(*gen.MangleLexer)
+	p.parser = parserPool.Get().(*gen.MangleParser)
+
+	p.lexer.SetInputStream(antlr.NewInputStream(p.input))
+	p.parser.SetInputStream(antlr.NewCommonTokenStream(p.lexer, 0))
+
+	p.lexer.AddErrorListener(p)
+	p.parser.AddErrorListener(p)
+	return nil
+}
+
+func (p *Parser) reset() {
+	// Reset the lexer and parser before putting them back in the pool.
+	p.lexer.RemoveErrorListeners()
+	p.parser.RemoveErrorListeners()
+	p.lexer.SetInputStream(nil)
+	p.parser.SetInputStream(nil)
+	lexerPool.Put(p.lexer)
+	parserPool.Put(p.parser)
+	p.lexer = nil
+	p.parser = nil
+}
+
+// SourceUnit consists of decls and clauses.
+type SourceUnit struct {
+	Decls   []ast.Decl
+	Clauses []ast.Clause
+}
+
+// Error represents a parser error messages, without location.
+type Error struct {
+	Message string
+	Line    int // 1-based line number within source.
+	Column  int // 0-based line number within source.
+}
+
+func newParser(input string) (*Parser, error) {
+	p := &Parser{input: input, errors: &errorsList{}}
+	if err := p.init(); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// Unit parses a source unit (clauses and decls).
+func Unit(reader io.Reader) (SourceUnit, error) {
+	bytes, err := io.ReadAll(reader)
+	if err != nil {
+		return SourceUnit{}, err
+	}
+	p, err := newParser(string(bytes))
+	if err != nil {
+		return SourceUnit{}, err
+	}
+	defer p.reset()
+	tree := p.parser.Start_()
+	if err := p.error(); err != nil {
+		return SourceUnit{}, err
+	}
+	sourceUnit := p.Visit(tree)
+	if err := p.error(); err != nil {
+		return SourceUnit{}, err
+	}
+	return sourceUnit.(SourceUnit), nil
+}
+
+func (p *Parser) error() error {
+	if len(p.errors.errors) == 0 {
+		return nil
+	}
+	var buf strings.Builder
+	for _, e := range p.errors.errors {
+		buf.WriteString(fmt.Sprintf("%d:%d %s\n", e.Line, e.Column, e.Message))
+	}
+	return errors.New(buf.String())
+}
+
+// Visit is the Visitor implementation.
+func (p *Parser) Visit(tree antlr.ParseTree) any {
+	switch tree.(type) {
+	case *gen.StartContext:
+		return p.VisitStart(tree.(*gen.StartContext))
+	case *gen.ProgramContext:
+		return p.VisitProgram(tree.(*gen.ProgramContext))
+	case *gen.PackageDeclContext:
+		return p.VisitPackageDecl(tree.(*gen.PackageDeclContext))
+	case *gen.UseDeclContext:
+		return p.VisitUseDecl(tree.(*gen.UseDeclContext))
+	case *gen.DeclContext:
+		return p.VisitDecl(tree.(*gen.DeclContext))
+	case *gen.DescrBlockContext:
+		return p.VisitDescrBlock(tree.(*gen.DescrBlockContext))
+	case *gen.BoundsBlockContext:
+		return p.VisitBoundsBlock(tree.(*gen.BoundsBlockContext))
+	case *gen.ConstraintsBlockContext:
+		return p.VisitConstraintsBlock(tree.(*gen.ConstraintsBlockContext))
+	case *gen.ClauseContext:
+		return p.VisitClause(tree.(*gen.ClauseContext))
+	case *gen.ClauseBodyContext:
+		return p.VisitClauseBody(tree.(*gen.ClauseBodyContext))
+	case *gen.TransformContext:
+		return p.VisitTransform(tree.(*gen.TransformContext))
+	case *gen.LetStmtContext:
+		return p.VisitLetStmt(tree.(*gen.LetStmtContext))
+	case *gen.LiteralOrFmlContext:
+		return p.VisitLiteralOrFml(tree.(*gen.LiteralOrFmlContext))
+	case *gen.VarContext:
+		return p.VisitVar(tree.(*gen.VarContext))
+	case *gen.ConstContext:
+		return p.VisitConst(tree.(*gen.ConstContext))
+	case *gen.NumContext:
+		return p.VisitNum(tree.(*gen.NumContext))
+	case *gen.FloatContext:
+		return p.VisitFloat(tree.(*gen.FloatContext))
+	case *gen.StrContext:
+		return p.VisitStr(tree.(*gen.StrContext))
+	case *gen.BStrContext:
+		return p.VisitBStr(tree.(*gen.BStrContext))
+	case *gen.ApplContext:
+		return p.VisitAppl(tree.(*gen.ApplContext))
+	case *gen.MapContext:
+		return p.VisitMap(tree.(*gen.MapContext))
+	case *gen.StructContext:
+		return p.VisitStruct(tree.(*gen.StructContext))
+	case *gen.ListContext:
+		return p.VisitList(tree.(*gen.ListContext))
+	case *gen.AtomContext:
+		return p.VisitAtom(tree.(*gen.AtomContext))
+	case *gen.AtomsContext:
+		return p.VisitAtoms(tree.(*gen.AtomsContext))
+	case *gen.DotTypeContext:
+		return p.VisitDotType(tree.(*gen.DotTypeContext))
+	case *gen.MemberContext:
+		return p.VisitMember(tree.(*gen.MemberContext))
+	case *gen.TemporalAnnotationContext:
+		return p.VisitTemporalAnnotation(tree.(*gen.TemporalAnnotationContext))
+	case *gen.TemporalBoundContext:
+		return p.VisitTemporalBound(tree.(*gen.TemporalBoundContext))
+	case *gen.TemporalOperatorContext:
+		return p.VisitTemporalOperator(tree.(*gen.TemporalOperatorContext))
+	}
+	p.errors.Add(fmt.Sprintf("parse error: %q", tree.GetText()), 0, 0)
+	return nil
+}
+
+// VisitStart visits a parse tree produced by MangleParser#start.
+func (p Parser) VisitStart(ctx *gen.StartContext) any {
+	return p.Visit(ctx.Program())
+}
+
+// VisitProgram visits a parse tree produced by MangleParser#program.
+func (p Parser) VisitProgram(ctx *gen.ProgramContext) any {
+	var decls []ast.Decl
+	if packageDeclCtx := ctx.PackageDecl(); packageDeclCtx != nil {
+		decls = append(decls, p.Visit(packageDeclCtx).(ast.Decl))
+	} else {
+		decls = append(decls, emptyPackage)
+	}
+	for _, u := range ctx.AllUseDecl() {
+		decls = append(decls, p.Visit(u).(ast.Decl))
+	}
+	for _, d := range ctx.AllDecl() {
+		decls = append(decls, p.Visit(d).(ast.Decl))
+	}
+	var clauses []ast.Clause
+	for _, c := range ctx.AllClause() {
+		clauses = append(clauses, p.Visit(c).(ast.Clause))
+	}
+	return SourceUnit{decls, clauses}
+}
+
+// VisitPackageDecl visits a parse tree produced by MangleParser#packageDecl.
+func (p Parser) VisitPackageDecl(ctx *gen.PackageDeclContext) any {
+	text := ctx.NAME().GetText()
+	if text != strings.ToLower(text) {
+		p.errors.Add(fmt.Sprintf("package names have to be lower-case: %s", text), ctx.GetStart().GetLine(), ctx.GetStart().GetColumn())
+	}
+	name := ast.NewAtom("name", ast.String(text))
+	atoms := []ast.Atom{name}
+	if atomsCtx := ctx.Atoms(); atomsCtx != nil {
+		atoms = append(atoms, p.Visit(atomsCtx).([]ast.Atom)...)
+	}
+	return ast.Decl{DeclaredAtom: ast.Atom{Predicate: symbols.Package}, Descr: atoms}
+}
+
+// VisitUseDecl visits a parse tree produced by MangleParser#useDecl.
+func (p Parser) VisitUseDecl(ctx *gen.UseDeclContext) any {
+	name := ast.NewAtom("name", ast.String(ctx.NAME().GetText()))
+	atoms := []ast.Atom{name}
+	if atomsCtx := ctx.Atoms(); atomsCtx != nil {
+		atoms = append(atoms, p.Visit(atomsCtx).([]ast.Atom)...)
+	}
+	return ast.Decl{DeclaredAtom: ast.Atom{Predicate: symbols.Use}, Descr: atoms}
+}
+
+// VisitDecl visits a parse tree produced by MangleParser#decl.
+func (p Parser) VisitDecl(ctx *gen.DeclContext) any {
+	atom := p.Visit(ctx.Atom()).(ast.Atom)
+	var descrAtoms []ast.Atom
+	if ctx.DescrBlock() != nil {
+		descrAtoms = p.Visit(ctx.DescrBlock()).([]ast.Atom)
+	}
+	// Check for 'temporal' keyword (T__0 corresponds to 'temporal' in the grammar)
+	if ctx.GetToken(gen.MangleParserT__0, 0) != nil {
+		descrAtoms = append(descrAtoms, ast.NewAtom(ast.DescrTemporal))
+	}
+	var bounds []ast.BoundDecl
+	for _, b := range ctx.AllBoundsBlock() {
+		bounds = append(bounds, p.Visit(b).(ast.BoundDecl))
+	}
+	var incl *ast.InclusionConstraint
+	if ctx.ConstraintsBlock() != nil {
+		gotIncl := p.Visit(ctx.ConstraintsBlock()).(ast.InclusionConstraint)
+		incl = &gotIncl
+	}
+	decl, err := ast.NewDecl(atom, descrAtoms, bounds, incl)
+	if err != nil {
+		p.errors.Add(err.Error(), ctx.GetStart().GetLine(), ctx.GetStart().GetColumn())
+		return ast.Decl{DeclaredAtom: atom}
+	}
+	return decl
+}
+
+// VisitDescrBlock visits a parse tree produced by MangleParser#descrBlock.
+func (p Parser) VisitDescrBlock(ctx *gen.DescrBlockContext) any {
+	return p.Visit(ctx.Atoms()).([]ast.Atom)
+}
+
+// VisitBoundsBlock visits a parse tree produced by MangleParser#boundsBlock.
+func (p Parser) VisitBoundsBlock(ctx *gen.BoundsBlockContext) any {
+	var baseTerms []ast.BaseTerm
+	for _, t := range ctx.AllTerm() {
+		term := p.Visit(t).(ast.Term)
+		baseTerm, ok := term.(ast.BaseTerm)
+		if !ok {
+			p.errors.Add(fmt.Sprintf("expected base term got %v", term), ctx.GetStart().GetLine(), ctx.GetStart().GetColumn())
+			baseTerms = append(baseTerms, ast.AnyBound)
+		}
+		baseTerms = append(baseTerms, baseTerm)
+	}
+	return ast.NewBoundDecl(baseTerms...)
+}
+
+// VisitConstraintsBlock visits a parse tree produced by MangleParser#constraintsBlock.
+func (p Parser) VisitConstraintsBlock(ctx *gen.ConstraintsBlockContext) any {
+	atoms := p.Visit(ctx.Atoms()).([]ast.Atom)
+	return ast.NewInclusionConstraint(atoms)
+}
+
+// VisitClause visits a parse tree produced by MangleParser#clause.
+func (p Parser) VisitClause(ctx *gen.ClauseContext) any {
+	head := p.Visit(ctx.Atom()).(ast.Atom)
+
+	// Check for temporal annotation on head
+	var headTime *ast.Interval
+	if tempAnnot := ctx.TemporalAnnotation(); tempAnnot != nil {
+		headTime = p.Visit(tempAnnot).(*ast.Interval)
+	}
+
+	if (ctx.COLONDASH() != nil) || (ctx.LONGLEFTDOUBLEARROW() != nil) {
+		body := p.Visit(ctx.ClauseBody()).(ast.Clause)
+		body.Head = head
+		body.HeadTime = headTime
+		return body
+	}
+	return ast.NewTemporalClause(head, headTime, nil)
+}
+
+// VisitClauseBody visits a parse tree produced by MangleParser#clauseBody.
+func (p Parser) VisitClauseBody(ctx *gen.ClauseBodyContext) any {
+	var premises []ast.Term
+	for _, litOrFml := range ctx.AllLiteralOrFml() {
+		premises = append(premises, p.Visit(litOrFml).(ast.Term))
+	}
+	clause := ast.NewClause(ast.Atom{}, premises)
+	var lastTransform *ast.Transform = nil
+	for _, l := range ctx.AllTransform() {
+		t := p.Visit(l).(ast.Transform)
+		if clause.Transform == nil {
+			clause.Transform = &t
+			lastTransform = &t
+		} else {
+			lastTransform.Next = &t
+			lastTransform = &t
+		}
+	}
+
+	return clause
+}
+
+// VisitTransform visits a parse tree produced by MangleParser#transform.
+func (p Parser) VisitTransform(ctx *gen.TransformContext) any {
+	var stmts []ast.TransformStmt
+	if ctx.DO() != nil {
+		term := p.Visit(ctx.Term()).(ast.Term)
+		apply, ok := term.(ast.ApplyFn)
+		if !ok {
+			p.errors.Add(fmt.Sprintf("expected fn application got %v", term), ctx.Term().GetStart().GetLine(), ctx.Term().GetStart().GetColumn())
+			return ast.Transform{}
+		}
+		stmts = append(stmts, ast.TransformStmt{nil, apply})
+	}
+	for _, l := range ctx.AllLetStmt() {
+		stmts = append(stmts, p.Visit(l).(ast.TransformStmt))
+	}
+	return ast.Transform{stmts, nil}
+}
+
+// VisitLetStmt visits a parse tree produced by MangleParser#letStmt.
+func (p Parser) VisitLetStmt(ctx *gen.LetStmtContext) any {
+	v := ast.Variable{ctx.VARIABLE().GetText()}
+	rhs := p.Visit(ctx.Term()).(ast.Term)
+	apply, ok := rhs.(ast.ApplyFn)
+	if !ok {
+		p.errors.Add(fmt.Sprintf("expected fn application got %v", rhs), ctx.Term().GetStart().GetLine(), ctx.Term().GetStart().GetColumn())
+		return ast.TransformStmt{&v, ast.ApplyFn{ast.FunctionSym{"fn:b0rk", 0}, nil}}
+	}
+	return ast.TransformStmt{&v, apply}
+}
+
+// VisitLiteralOrFml visits a parse tree produced by literalOrFml
+func (p Parser) VisitLiteralOrFml(ctx *gen.LiteralOrFmlContext) any {
+	term := p.Visit(ctx.Term(0)).(ast.Term)
+	atom, ok := term.(ast.Atom)
+
+	// Handle negation
+	if ctx.BANG() != nil {
+		if !ok {
+			p.errors.Add(fmt.Sprintf("not a literal or fml: %v", ctx.Term(0).GetText()), ctx.Term(0).GetStart().GetLine(), ctx.Term(0).GetStart().GetColumn())
+		}
+		return ast.NegAtom{atom}
+	}
+
+	// Check for temporal operator
+	var tempOp *ast.TemporalOperator
+	if tempOpCtx := ctx.TemporalOperator(); tempOpCtx != nil {
+		tempOp = p.Visit(tempOpCtx).(*ast.TemporalOperator)
+	}
+
+	// Check for temporal annotation
+	var tempAnnot *ast.Interval
+	if tempAnnotCtx := ctx.TemporalAnnotation(); tempAnnotCtx != nil {
+		tempAnnot = p.Visit(tempAnnotCtx).(*ast.Interval)
+	}
+
+	// If no comparison operator, it's a simple literal (possibly with temporal annotations)
+	if ctx.EQ() == nil && ctx.BANGEQ() == nil && ctx.LESS() == nil && ctx.LESSEQ() == nil && ctx.GREATER() == nil && ctx.GREATEREQ() == nil {
+		if ok {
+			// If there's a temporal operator or annotation, wrap in TemporalLiteral
+			if tempOp != nil || tempAnnot != nil {
+				return ast.TemporalLiteral{
+					Literal:  atom,
+					Operator: tempOp,
+					Interval: tempAnnot,
+				}
+			}
+			return atom
+		}
+		p.errors.Add(fmt.Sprintf("parse error: %v", ctx.GetText()), ctx.GetStart().GetLine(), ctx.GetStart().GetColumn())
+		return ast.NewAtom("br0ken")
+	}
+
+	// Handle comparison operators
+	left := p.Visit(ctx.Term(0)).(ast.Term)
+	leftBase, ok := left.(ast.BaseTerm)
+	if !ok {
+		p.errors.Add(fmt.Sprintf("not a base term: %v", ctx.Term(0).GetText()), ctx.Term(0).GetStart().GetLine(), ctx.Term(0).GetStart().GetColumn())
+	}
+	right := p.Visit(ctx.Term(1)).(ast.Term)
+	rightBase, ok := right.(ast.BaseTerm)
+	if !ok {
+		p.errors.Add(fmt.Sprintf("not a base term: %v", ctx.Term(1).GetText()), ctx.Term(1).GetStart().GetLine(), ctx.Term(1).GetStart().GetColumn())
+	}
+
+	if ctx.EQ() != nil {
+		return ast.Eq{leftBase, rightBase}
+	}
+	if ctx.BANGEQ() != nil {
+		return ast.Ineq{leftBase, rightBase}
+	}
+	if ctx.LESS() != nil {
+		return ast.NewAtom(":lt", leftBase, rightBase)
+	}
+	if ctx.LESSEQ() != nil {
+		return ast.NewAtom(":le", leftBase, rightBase)
+	}
+	if ctx.GREATER() != nil {
+		return ast.NewAtom(":gt", leftBase, rightBase)
+	}
+	return ast.NewAtom(":ge", leftBase, rightBase)
+}
+
+// VisitVar visits a parse tree produced by MangleParser#Var.
+func (p Parser) VisitVar(ctx *gen.VarContext) any {
+	return ast.Variable{ctx.VARIABLE().GetText()}
+}
+
+// VisitConst visits a parse tree produced by MangleParser#Const.
+func (p Parser) VisitConst(ctx *gen.ConstContext) any {
+	nameConstant, err := ast.Name(ctx.CONSTANT().GetText())
+	if err != nil {
+		p.errors.Add(err.Error(), ctx.GetStart().GetLine(), ctx.GetStart().GetColumn())
+		return ast.AnyBound
+	}
+	return nameConstant
+}
+
+// VisitNum visits a parse tree produced by MangleParser#Num.
+func (p Parser) VisitNum(ctx *gen.NumContext) any {
+	num, err := strconv.ParseInt(ctx.NUMBER().GetText(), 10, 64)
+	if err != nil {
+		p.errors.Add(err.Error(), ctx.GetStart().GetLine(), ctx.GetStart().GetColumn())
+		return ast.Number(-1)
+	}
+	return ast.Number(num)
+}
+
+// VisitFloat visits a parse tree produced by MangleParser#Float.
+func (p Parser) VisitFloat(ctx *gen.FloatContext) any {
+	floatNum, err := strconv.ParseFloat(ctx.FLOAT().GetText(), 64)
+	if err != nil {
+		p.errors.Add(err.Error(), ctx.GetStart().GetLine(), ctx.GetStart().GetColumn())
+		return ast.Float64(-1)
+	}
+	return ast.Float64(floatNum)
+}
+
+// VisitStr visits a parse tree produced by MangleParser#Str.
+func (p Parser) VisitStr(ctx *gen.StrContext) any {
+	text := ctx.STRING().GetText()
+	text = text[1 : len(text)-1]
+	text, err := ast.Unescape(text, false /* isBytes */)
+	if err != nil {
+		p.errors.Add(err.Error(), ctx.GetStart().GetLine(), ctx.GetStart().GetColumn())
+		return ast.String("<BAD>")
+	}
+	return ast.String(text)
+}
+
+// VisitBStr visits a parse tree produced by MangleParser#BStr.
+func (p Parser) VisitBStr(ctx *gen.BStrContext) any {
+	text := ctx.BYTESTRING().GetText()
+	text = text[2 : len(text)-1]
+	text, err := ast.Unescape(text, true /* isBytes */)
+	if err != nil {
+		p.errors.Add(err.Error(), ctx.GetStart().GetLine(), ctx.GetStart().GetColumn())
+		return ast.Bytes([]byte("<BAD>"))
+	}
+	return ast.Bytes([]byte(text))
+}
+
+// VisitAppl visits a parse tree produced by MangleParser#Appl.
+func (p Parser) VisitAppl(ctx *gen.ApplContext) any {
+	name := ctx.NAME().GetText()
+
+	if strings.HasPrefix(name, "fn:") {
+		// Either ast.Atom or ast.ApplyFn
+		var args []ast.BaseTerm
+		for _, e := range ctx.AllTerm() {
+			arg := p.Visit(e)
+			baseTerm, ok := arg.(ast.BaseTerm)
+			if !ok {
+				p.errors.Add(fmt.Sprintf("expected base term got %v", arg), e.GetStart().GetLine(), e.GetStart().GetColumn())
+				continue
+			}
+			args = append(args, baseTerm)
+		}
+		fnSym := ast.FunctionSym{name, len(args)}
+		return ast.ApplyFn{fnSym, args}
+	}
+
+	var args []ast.BaseTerm
+	for _, e := range ctx.AllTerm() {
+		arg := p.Visit(e)
+		baseTerm, ok := arg.(ast.BaseTerm)
+		if !ok {
+			p.errors.Add(fmt.Sprintf("expected base term got %v", arg), e.GetStart().GetLine(), e.GetStart().GetColumn())
+			args = append(args, ast.AnyBound)
+			continue
+		}
+		args = append(args, baseTerm)
+	}
+	predicateSym := ast.PredicateSym{ctx.NAME().GetText(), len(args)}
+	return ast.Atom{predicateSym, args}
+}
+
+// VisitMap visits a parse tree produced by MangleParser#Map.
+func (p Parser) VisitMap(ctx *gen.MapContext) any {
+	var args []ast.BaseTerm
+	termCtxs := ctx.AllTerm()
+	for _, e := range termCtxs {
+		arg := p.Visit(e)
+		baseTerm, ok := arg.(ast.BaseTerm)
+		if !ok {
+			p.errors.Add(fmt.Sprintf("expected base term got %v", arg), e.GetStart().GetLine(), e.GetStart().GetColumn())
+			args = append(args, ast.AnyBound)
+			continue
+		}
+		args = append(args, baseTerm)
+	}
+	return ast.ApplyFn{ast.FunctionSym{"fn:map", -1}, args}
+}
+
+// VisitStruct visits a parse tree produced by MangleParser#Struct.
+func (p Parser) VisitStruct(ctx *gen.StructContext) any {
+	var args []ast.BaseTerm
+	for _, e := range ctx.AllTerm() {
+		arg := p.Visit(e)
+		baseTerm, ok := arg.(ast.BaseTerm)
+		if !ok {
+			p.errors.Add(fmt.Sprintf("expected base term got %v", arg), e.GetStart().GetLine(), e.GetStart().GetColumn())
+			args = append(args, ast.AnyBound)
+			continue
+		}
+		args = append(args, baseTerm)
+	}
+	return ast.ApplyFn{ast.FunctionSym{"fn:struct", -1}, args}
+}
+
+// VisitList visits a parse tree produced by MangleParser#List.
+func (p Parser) VisitList(ctx *gen.ListContext) any {
+	var args []ast.BaseTerm
+	for _, e := range ctx.AllTerm() {
+		arg := p.Visit(e)
+		baseTerm, ok := arg.(ast.BaseTerm)
+		if !ok {
+			p.errors.Add(fmt.Sprintf("expected base term got %v", arg), e.GetStart().GetLine(), e.GetStart().GetColumn())
+			args = append(args, ast.AnyBound)
+			continue
+		}
+		args = append(args, baseTerm)
+	}
+	return ast.ApplyFn{ast.FunctionSym{"fn:list", -1}, args}
+}
+
+// VisitAtom visits a parse tree produced by MangleParser#atoms.
+func (p Parser) VisitAtom(ctx *gen.AtomContext) any {
+	term := p.Visit(ctx.Term())
+	atom, ok := term.(ast.Atom)
+	if !ok {
+		p.errors.Add(fmt.Sprintf("expected atom got %v", term), ctx.GetStart().GetLine(), ctx.GetStart().GetColumn())
+		return ast.NewAtom("b0rken")
+	}
+	return atom
+}
+
+// VisitAtoms visits a parse tree produced by MangleParser#atoms.
+func (p Parser) VisitAtoms(ctx *gen.AtomsContext) any {
+	var atoms []ast.Atom
+	for _, e := range ctx.AllAtom() {
+		atom := p.Visit(e).(ast.Atom)
+		atoms = append(atoms, atom)
+	}
+	return atoms
+}
+
+func (p Parser) VisitDotType(ctx *gen.DotTypeContext) any {
+	typename := ctx.DOT_TYPE().GetText()[1:]
+	var baseterms []ast.BaseTerm
+	for _, e := range ctx.AllMember() {
+		member := p.Visit(e).([]ast.BaseTerm)
+		baseterms = append(baseterms, member...)
+	}
+	return ast.ApplyFn{ast.FunctionSym{"fn:" + typename, -1}, baseterms}
+}
+
+func (p Parser) VisitMember(ctx *gen.MemberContext) any {
+	var baseterms []ast.BaseTerm
+	for _, e := range ctx.AllTerm() {
+		term := p.Visit(e).(ast.Term)
+		baseterm, ok := term.(ast.BaseTerm)
+		if !ok {
+			p.errors.Add(fmt.Sprintf("expected base term got %v", term), e.GetStart().GetLine(), e.GetStart().GetColumn())
+			baseterms = append(baseterms, ast.AnyBound)
+			continue
+		}
+		baseterms = append(baseterms, baseterm)
+	}
+	if strings.HasPrefix(ctx.GetText(), "opt") {
+		return []ast.BaseTerm{ast.ApplyFn{ast.FunctionSym{"fn:opt", -1}, baseterms}}
+	}
+	return baseterms
+}
+
+// PredicateName parses a predicate name.
+func PredicateName(s string) (string, error) {
+	p, err := newParser(s)
+	if err != nil {
+		return "", err
+	}
+	tok := p.lexer.NextToken()
+	if err := p.error(); err != nil {
+		return "", err
+	}
+	if tok.GetTokenType() == gen.MangleLexerNAME {
+		return tok.GetText(), nil
+	}
+	return "", nil
+}
+
+// Clause parses a single clause.
+func Clause(s string) (ast.Clause, error) {
+	p, err := newParser(s)
+	if err != nil {
+		return ast.Clause{}, err
+	}
+	defer p.reset()
+
+	tree := p.parser.Clause()
+	if err := p.error(); err != nil {
+		return ast.Clause{}, err
+	}
+	clause := p.Visit(tree)
+	if err := p.error(); err != nil {
+		return ast.Clause{}, err
+	}
+	return clause.(ast.Clause), nil
+}
+
+// LiteralOrFormula parses a single Term, an equality or inequality from a given string.
+func LiteralOrFormula(s string) (ast.Term, error) {
+	p, err := newParser(s)
+	if err != nil {
+		return nil, err
+	}
+	defer p.reset()
+
+	tree := p.parser.LiteralOrFml()
+	if err := p.error(); err != nil {
+		return nil, err
+	}
+	term := p.Visit(tree)
+	if err := p.error(); err != nil {
+		return nil, err
+	}
+	return term.(ast.Term), nil
+}
+
+// Term parses a Term from given string.
+func Term(s string) (ast.Term, error) {
+	p, err := newParser(s)
+	if err != nil {
+		return nil, err
+	}
+	defer p.reset()
+
+	tree := p.parser.Term()
+	if err := p.error(); err != nil {
+		return nil, err
+	}
+	term := p.Visit(tree)
+	if err := p.error(); err != nil {
+		return nil, err
+	}
+	return term.(ast.Term), nil
+}
+
+// BaseTerm parses a BaseTerm from given string.
+func BaseTerm(s string) (ast.BaseTerm, error) {
+	term, err := Term(s)
+	if err != nil {
+		return nil, err
+	}
+	baseTerm, ok := term.(ast.BaseTerm)
+	if ok {
+		return baseTerm, nil
+	}
+	return nil, fmt.Errorf("not a base term: %v %T", term, term)
+}
+
+// Atom parses an Atom from given string.
+func Atom(s string) (ast.Atom, error) {
+	term, err := Term(s)
+	if err != nil {
+		return ast.Atom{}, err
+	}
+	atom, ok := term.(ast.Atom)
+	if !ok {
+		return ast.Atom{}, fmt.Errorf("not an atom: %v %T", term, term)
+	}
+	return atom, nil
+}
+
+func nameAtom(name string) ast.Atom {
+	return ast.Atom{Predicate: ast.PredicateSym{Symbol: "name", Arity: 1}, Args: []ast.BaseTerm{ast.String(name)}}
+}
+
+// SyntaxError is called by ANTLR generated code when a syntax error is encountered.
+func (p *Parser) SyntaxError(recognizer antlr.Recognizer, offendingSymbol any, line, column int, msg string, e antlr.RecognitionException) {
+	p.errors.Add(msg, line, column)
+}
+
+// ReportAmbiguity implements error listener interface.
+func (p *Parser) ReportAmbiguity(recognizer antlr.Parser, dfa *antlr.DFA, startIndex, stopIndex int, exact bool, ambigAlts *antlr.BitSet, configs *antlr.ATNConfigSet) {
+	// Intentional
+}
+
+// ReportAttemptingFullContext implements error listener interface.
+func (p *Parser) ReportAttemptingFullContext(recognizer antlr.Parser, dfa *antlr.DFA, startIndex, stopIndex int, conflictingAlts *antlr.BitSet, configs *antlr.ATNConfigSet) {
+	// Intentional
+}
+
+// ReportContextSensitivity  implements error listener interface.
+func (p *Parser) ReportContextSensitivity(recognizer antlr.Parser, dfa *antlr.DFA, startIndex, stopIndex, prediction int, configs *antlr.ATNConfigSet) {
+	// Intentional
+}
+
+// VisitTemporalAnnotation visits a parse tree produced by MangleParser#temporalAnnotation.
+// Returns an *ast.Interval.
+func (p Parser) VisitTemporalAnnotation(ctx *gen.TemporalAnnotationContext) any {
+	bounds := ctx.AllTemporalBound()
+	if len(bounds) == 0 {
+		p.errors.Add("temporal annotation requires at least one bound", ctx.GetStart().GetLine(), ctx.GetStart().GetColumn())
+		return nil
+	}
+
+	start := p.Visit(bounds[0]).(ast.TemporalBound)
+
+	var end ast.TemporalBound
+	if len(bounds) > 1 {
+		end = p.Visit(bounds[1]).(ast.TemporalBound)
+	} else {
+		// Point interval: @[t] means @[t, t]
+		end = start
+	}
+
+	if start.Type == ast.VariableBound && start.Variable.Symbol == "_" {
+		start = ast.NegativeInfinity()
+	}
+	if end.Type == ast.VariableBound && end.Variable.Symbol == "_" {
+		end = ast.PositiveInfinity()
+	}
+
+	interval := ast.NewInterval(start, end)
+	return &interval
+}
+
+// VisitTemporalBound visits a parse tree produced by MangleParser#temporalBound.
+// Returns an ast.TemporalBound.
+func (p Parser) VisitTemporalBound(ctx *gen.TemporalBoundContext) any {
+	if ts := ctx.TIMESTAMP(); ts != nil {
+		text := ts.GetText()
+		t, err := parseTimestamp(text)
+		if err != nil {
+			p.errors.Add(fmt.Sprintf("invalid timestamp %q: %v", text, err), ctx.GetStart().GetLine(), ctx.GetStart().GetColumn())
+			return ast.TemporalBound{}
+		}
+		return ast.NewTimestampBound(t)
+	}
+
+	if dur := ctx.DURATION(); dur != nil {
+		text := dur.GetText()
+		d, err := parseDuration(text)
+		if err != nil {
+			p.errors.Add(fmt.Sprintf("invalid duration %q: %v", text, err), ctx.GetStart().GetLine(), ctx.GetStart().GetColumn())
+			return ast.TemporalBound{}
+		}
+		return ast.NewDurationBound(d)
+	}
+
+	if v := ctx.VARIABLE(); v != nil {
+		text := v.GetText()
+		return ast.NewVariableBound(ast.Variable{Symbol: text})
+	}
+
+	// Check for 'now' keyword
+	if ctx.GetText() == "now" {
+		return ast.Now()
+	}
+
+	p.errors.Add("unknown temporal bound", ctx.GetStart().GetLine(), ctx.GetStart().GetColumn())
+	return ast.TemporalBound{}
+}
+
+// VisitTemporalOperator visits a parse tree produced by MangleParser#temporalOperator.
+// Returns an *ast.TemporalOperator.
+func (p Parser) VisitTemporalOperator(ctx *gen.TemporalOperatorContext) any {
+	bounds := ctx.AllTemporalBound()
+	if len(bounds) != 2 {
+		p.errors.Add("temporal operator requires exactly two bounds", ctx.GetStart().GetLine(), ctx.GetStart().GetColumn())
+		return nil
+	}
+
+	// Check for negative durations in temporal operator bounds.
+	// The temporal operator determines direction (past/future), not the duration sign.
+	// Negative durations are rejected to avoid confusion.
+	for _, boundCtx := range bounds {
+		if dur := boundCtx.(*gen.TemporalBoundContext).DURATION(); dur != nil {
+			text := dur.GetText()
+			if strings.HasPrefix(text, "-") {
+				p.errors.Add(
+					fmt.Sprintf("negative duration %q not allowed in temporal operator; use the operator type to indicate direction (e.g., <-[...] for past, <+[...] for future)", text),
+					boundCtx.GetStart().GetLine(), boundCtx.GetStart().GetColumn())
+			}
+		}
+	}
+
+	start := p.Visit(bounds[0]).(ast.TemporalBound)
+	end := p.Visit(bounds[1]).(ast.TemporalBound)
+	interval := ast.NewInterval(start, end)
+
+	var opType ast.TemporalOperatorType
+	if ctx.DIAMONDMINUS() != nil {
+		opType = ast.DiamondMinus
+	} else if ctx.BOXMINUS() != nil {
+		opType = ast.BoxMinus
+	} else if ctx.DIAMONDPLUS() != nil {
+		opType = ast.DiamondPlus
+	} else if ctx.BOXPLUS() != nil {
+		opType = ast.BoxPlus
+	} else {
+		p.errors.Add("unknown temporal operator", ctx.GetStart().GetLine(), ctx.GetStart().GetColumn())
+		return nil
+	}
+
+	return &ast.TemporalOperator{
+		Type:     opType,
+		Interval: interval,
+	}
+}
+
+// parseTimestamp parses a timestamp string in ISO 8601 format.
+func parseTimestamp(s string) (time.Time, error) {
+	// Try various formats
+	formats := []string{
+		"2006-01-02T15:04:05Z",
+		"2006-01-02T15:04:05",
+		"2006-01-02",
+	}
+
+	for _, format := range formats {
+		if t, err := time.Parse(format, s); err == nil {
+			return t, nil
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("unable to parse timestamp: %s", s)
+}
+
+// parseDuration parses a duration string like "7d", "24h", "30m", "1s", "500ms".
+// parseDuration parses a Go-style duration string.
+// Supported units: h (hours), m (minutes), s (seconds), ms (milliseconds), us/µs (microseconds), ns (nanoseconds)
+// Examples: "1h30m", "500ms", "2h45m30s"
+// Note: Days ('d') are supported by converting to hours (24h).
+func parseDuration(s string) (time.Duration, error) {
+	if s == "" {
+		return 0, fmt.Errorf("empty duration string")
+	}
+	// Handle days manually since time.ParseDuration doesn't support 'd'
+	if strings.HasSuffix(s, "d") {
+		daysStr := strings.TrimSuffix(s, "d")
+		days, err := strconv.ParseInt(daysStr, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid duration days: %v", err)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	return time.ParseDuration(s)
+}

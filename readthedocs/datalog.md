@@ -1,0 +1,277 @@
+# Getting to know Datalog
+
+Mangle is based on Datalog. Datalog is a minimal formal language
+that lets us talk about databases and queries. In order to learn Mangle,
+it's helpful to learn Datalog first.
+
+Fortunately, Datalog is easy to learn and has very few concepts.
+In this section, we introduce these concepts using an example:
+a database of volunteers and their skills.
+Take a look at this table:
+
+| ID | Name | Skill |
+|----|------|-------|
+| 1 | Aisha Salehi| Teaching |
+| 2 | Xin Watson  | Workshop Facilitation |
+| 3 | Alyssa P. Hacker  | Software Development |
+
+The Datalog view of a table is that it is an enumeration of
+facts. A fact is an expression like
+`volunteer(1, "Aisha Salehi", /teaching)` which describes
+the data in a row. The name of the table
+becomes a predicate, and the data in every column becomes an
+argument. As we will see, formal notation (syntax) enables us to
+do precise reasoning with rules. This approach has its roots in
+mathematical logic.
+
+We can write a Datalog program that generates facts:
+
+```
+volunteer(1, "Aisha Salehi", /teaching).
+volunteer(2, "Xin Watson", /workshop_facilitation).
+volunteer(3, "Alyssa P. Hacker", /software_development).
+```
+
+The statements above are the simplest form of Datalog rules. They are called
+facts, as they don't have any premises and just state what is true.
+Normally, a database is not defined within a program, but exists outside
+the program. This is just an example to get familiar.
+
+## Atoms and Matching
+
+A rule describes how to obtain new facts from existing ones. Before we look
+at rules that have premises, we need to understand matching.
+
+Predicates can also be applied to variables like `X` or `Name`. Variables act
+as placeholders for data. When the arguments of a predicate can contain
+variables in addition to constants, we call the expression an *atom*.
+Every fact is an atom, but there are atoms that are not facts (because they
+contain at least one variable).
+
+A fact *matches* an atom when there is a way to assign values to the
+atom's variables that make the atom and the fact equal.
+
+For example, the fact `volunteer(3, "Alyssa P. Hacker", /software_development)`
+matches the atom `volunteer(3, Name, Skill)` because we can set
+`Name` to `"Alyssa P. Hacker"` and `Skill` to `/software_development` to
+make the fact and atom equal.
+The other facts above do not match, since the first position (which
+would be the ID column in the table) has a different value. It is often useful
+to pick descriptive variables names and use them like column names. When
+the name is not needed (we want to match any value), we can use `_`.
+
+Now we can define a proper rule. Let's find everyone who has the `/teaching`
+skill:
+
+```
+teacher(ID, Name) ⟸ volunteer(ID, Name, /teaching).
+```
+
+(Mangle Datalog also supports the older notation `:-` instead of `⟸`.)
+
+This rule involves variables `ID` and `Name`. Note that they appear both
+on the left-hand side (the *head*) as well as the right-hand side (the *body*)
+of the `⟸`.
+
+Conceptually, we can imagine that a Datalog engine will try out all
+possible combinations of values that produce a match for all atoms in the
+body. When this is successful, the engine uses the variable assignment to
+create a new fact from the head. In reality, there are faster ways to find
+all matches.
+
+:::{admonition} Click to see SQL translation
+:class: dropdown
+Here is how the `teacher` rule looks like in SQL:
+```sql
+CREATE TABLE teacher AS
+SELECT ID, Name
+FROM volunteer
+WHERE Role = '/teaching';
+```
+:::
+
+Rules are connected to databases in several ways:
+
+- each atom in a rule body is like a simple database query
+- the rule as a whole is also a (more complex) database query
+- since rules come with predicate names, they also *define* a new
+table of results (say, a new `teacher` table in the example above)
+which can be queried again.
+
+Using rules to infer new facts from existing ones is called deduction in
+logic. For this reason, Datalog systems are often called deductive database
+systems.
+
+## Multiple atoms and multiple rules
+
+We will now briefly see how to combine queries.
+Iit is likely that a volunteer has more than one skill. Let's expand the
+example:
+
+| ID | Name | Skills |
+|----|------|-------|
+| 1 | Aisha Salehi| Teaching, Workshop Facilitation |
+| 2 | Xin Watson  | Workshop Facilitation |
+| 3 | Alyssa P. Hacker  | Software Development, Workshop Facilitation |
+
+We could turn each row into multiple facts by duplicating values:
+
+```
+volunteer(1, "Aisha Salehi", /teaching).
+volunteer(1, "Aisha Salehi", /workshop_facilitation).
+volunteer(2, "Xin Watson", /workshop_facilitation).
+volunteer(3, "Alyssa P. Hacker", /software_development).
+volunteer(3, "Alyssa P. Hacker", /workshop_facilitation).
+```
+
+Now, suppose we are organizing a coding workshop. We already have a
+facilitator but are looking for a teachers and software developers.
+
+We can simply write two rules, and the resulting table will be the union
+of all facts that are generated by each one.
+
+```
+coding_workshop_candidate(ID, Name, /teaching) ⟸
+    volunteer(ID, Name, /teaching).
+coding_workshop_candidate(ID, Name, /software_development) ⟸
+    volunteer(ID, Name, /software_development).
+```
+
+:::{admonition} Click to see SQL translation
+:class: dropdown
+Here is how the `coding_workshop_candidate` rules look like in SQL:
+```sql
+CREATE TABLE coding_workshop_candidate AS
+SELECT ID, Name, Role
+FROM volunteer
+WHERE Role = '/teaching'
+UNION
+SELECT ID, Name, Role
+FROM volunteer
+WHERE Role = '/software_development';
+```
+:::
+
+If instead, we want a single person who knows both, teaching and
+software development, we use multiple atoms in the body, separated
+by a comma:
+
+```
+teacher_and_coder(ID, Name) ⟸
+    volunteer(ID, Name, /teaching),
+    volunteer(ID, Name, /software_development).
+```
+
+In our current data set, the result will be empty. This rule is an
+example of a database join: the body states that two rows have the
+same ID and Name fields.
+
+:::{admonition} Click to see SQL translation
+:class: dropdown
+Here is how the `teacher_and_coder` rule looks like in SQL:
+```sql
+CREATE TABLE teacher_and_coder AS
+SELECT DISTINCT v1.ID, v1.Name
+FROM volunteer AS v1
+JOIN volunteer AS v2 ON v1.ID = v2.ID AND v1.Name = v2.Name
+WHERE
+    v1.Role = '/teaching'
+    AND v2.Role = '/software_development';
+```
+:::
+
+## Recursive rules
+
+Rules can be recursive: when defining a relation using rules, it is
+permitted to refer to the relation that is being defined.
+
+Check out the following facts:
+
+```
+knows("Aisha", "Xin").
+knows("Xin", "Alyssa").
+knows("Alyssa", "Selin").
+```
+
+We can write a recursive rule that follows the chain of acquaintances.
+
+```
+reachable(X, Y) ⟸ knows(X, Y).
+reachable(X, Z) ⟸ knows(X, Y), reachable(Y, Z).
+```
+
+The first rule says that `reachable` contains all rows of `knows` table.
+Conceptually, the second rule says that whenever an entry in the
+`knows` table can be connected to one in the `reachable` table, then we
+should add add a new entry. When all such entries are added, we know
+who can reach whom. This is called a fixed point.
+
+:::{admonition} Click to see SQL translation
+:class: dropdown
+Here is how the `reachable` rules look like in SQL:
+```sql
+CREATE TABLE reachable AS
+WITH RECURSIVE reachable_cte (StartPerson, EndPerson) AS (
+    -- Base Case
+    SELECT Person1, Person2
+    FROM knows
+
+    UNION ALL
+
+    -- Recursive Step
+    SELECT
+        r.StartPerson,
+        k.Person2
+    FROM
+        reachable_cte AS r
+    JOIN
+        knows AS k ON r.EndPerson = k.Person1
+)
+SELECT DISTINCT StartPerson, EndPerson
+FROM reachable_cte;
+```
+:::
+
+## The Safety Condition
+
+To recap, the general form of a rule is that it can have two forms:
+
+* either a fact, followed by a dot. Such a rule has an empty body.
+* or a head expression, followed by `⟸` (or the older notation, `:-`),
+followed by a body, and a dot. The body can consist of multiple atoms.
+
+The use of variables is subject to a condition: all variables that
+appear in the head must also appear in the body. This condition (which we
+the safety condition) ensures that a rule is defined: there is an
+effective way to find the facts described in the head and that the overall
+process terminates.
+
+One consequence is that a rule without a body cannot use any variables.
+
+The safety condition is what justifies our conceptual approach of finding
+the values to match the rule body. If there were unused variables in the rule
+head, then finding values to mach the body would not be enough to produce a
+fact; one would also have to invent arbitrary values for the head variables.
+The safety condition ensures that the rules fully determine what gets
+computed.
+
+## Naive evaluation
+
+An introduction to Datalog is not complete without a description of the
+evaluation algorithm. It is very simple:
+
+1. Start with a set of facts (the extensional database, possibly empty)
+2. Repeat until no new fact is added:
+  * for every rule
+    * use the set of facts to match every atom `p(...)` in the body
+    * if successful, add a new fact to the set of facts.
+
+In computer science, this is known as fixed-point computation. We will not
+prove termination here but only mention that due to the safety condition
+every rule is constrained in what new facts it can produce.
+
+Naive evaluation is very inefficient because it computes the same information
+over and over again. It is useful to specify what the meaning of a Datalog
+program is, even in the presence of recursive rules. No matter how
+sophisticated a Datalog implementation may be, it has to produce the same
+result.

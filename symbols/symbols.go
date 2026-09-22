@@ -1,0 +1,1090 @@
+// Copyright 2022 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package symbols contains symbols for built-in functions and predicates.
+package symbols
+
+import (
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+
+	"codeberg.org/TauCeti/mangle-go/ast"
+)
+
+var (
+	// MatchPrefix matches name constants that have a given prefix.
+	MatchPrefix = ast.PredicateSym{":match_prefix", 2}
+
+	// StartsWith matches string constants that have a given prefix.
+	StartsWith = ast.PredicateSym{":string:starts_with", 2}
+
+	// EndsWith matches string constants that have a given suffix.
+	EndsWith = ast.PredicateSym{":string:ends_with", 2}
+
+	// Contains matches string constants that contain the given string.
+	Contains = ast.PredicateSym{":string:contains", 2}
+
+	// Filter is turning a boolean function into a predicate.
+	Filter = ast.PredicateSym{":filter", 1}
+
+	// Lt is the less-than relation on numbers.
+	Lt = ast.PredicateSym{":lt", 2}
+
+	// Le is the less-than-or-equal relation on numbers.
+	Le = ast.PredicateSym{":le", 2}
+
+	// Gt is the greater-than relation on numbers.
+	Gt = ast.PredicateSym{":gt", 2}
+
+	// Ge is the greater-than-or-equal relation on numbers.
+	Ge = ast.PredicateSym{":ge", 2}
+
+	// TimeLt is the less-than relation on time instants.
+	TimeLt = ast.PredicateSym{":time:lt", 2}
+	// TimeLe is the less-than-or-equal relation on time instants.
+	TimeLe = ast.PredicateSym{":time:le", 2}
+	// TimeGt is the greater-than relation on time instants.
+	TimeGt = ast.PredicateSym{":time:gt", 2}
+	// TimeGe is the greater-than-or-equal relation on time instants.
+	TimeGe = ast.PredicateSym{":time:ge", 2}
+
+	// DurationLt is the less-than relation on durations.
+	DurationLt = ast.PredicateSym{":duration:lt", 2}
+	// DurationLe is the less-than-or-equal relation on durations.
+	DurationLe = ast.PredicateSym{":duration:le", 2}
+	// DurationGt is the greater-than relation on durations.
+	DurationGt = ast.PredicateSym{":duration:gt", 2}
+	// DurationGe is the greater-than-or-equal relation on durations.
+	DurationGe = ast.PredicateSym{":duration:ge", 2}
+
+	// FloatLt is the less-than relation on float64 values.
+	FloatLt = ast.PredicateSym{":float:lt", 2}
+	// FloatLe is the less-than-or-equal relation on float64 values.
+	FloatLe = ast.PredicateSym{":float:le", 2}
+	// FloatGt is the greater-than relation on float64 values.
+	FloatGt = ast.PredicateSym{":float:gt", 2}
+	// FloatGe is the greater-than-or-equal relation on float64 values.
+	FloatGe = ast.PredicateSym{":float:ge", 2}
+
+	// MatchPair mode(+, -, -) matches a pair to its elements.
+	MatchPair = ast.PredicateSym{":match_pair", 3}
+
+	// MatchCons mode(+, -, -) matches a list to head and tail.
+	MatchCons = ast.PredicateSym{":match_cons", 3}
+
+	// MatchNil matches the empty list.
+	MatchNil = ast.PredicateSym{":match_nil", 1}
+
+	// MatchEntry mode(+, +, -) matches an entry in a map.
+	MatchEntry = ast.PredicateSym{":match_entry", 3}
+
+	// MatchField mode(+, +, -) matches a field in a struct.
+	MatchField = ast.PredicateSym{":match_field", 3}
+
+	// ListMember mode(+, -) either checks membership or binds var to every element.
+	ListMember = ast.PredicateSym{":list:member", 2}
+
+	// WithinDistance is a relation on numbers X, Y, Z satisfying |X - Y| < Z.
+	WithinDistance = ast.PredicateSym{":within_distance", 3}
+
+	// Temporal interval predicates (Allen's interval algebra)
+
+	// IntervalBefore checks if interval T1 ends before interval T2 starts.
+	IntervalBefore = ast.PredicateSym{":interval:before", 2}
+	// IntervalAfter checks if interval T1 starts after interval T2 ends.
+	IntervalAfter = ast.PredicateSym{":interval:after", 2}
+	// IntervalMeets checks if interval T1 ends exactly when T2 starts.
+	IntervalMeets = ast.PredicateSym{":interval:meets", 2}
+	// IntervalOverlaps checks if intervals T1 and T2 share some time.
+	IntervalOverlaps = ast.PredicateSym{":interval:overlaps", 2}
+	// IntervalDuring checks if interval T1 is contained within T2.
+	IntervalDuring = ast.PredicateSym{":interval:during", 2}
+	// IntervalContains checks if interval T1 contains T2.
+	IntervalContains = ast.PredicateSym{":interval:contains", 2}
+	// IntervalStarts checks if intervals T1 and T2 start at the same time.
+	IntervalStarts = ast.PredicateSym{":interval:starts", 2}
+	// IntervalFinishes checks if intervals T1 and T2 end at the same time.
+	IntervalFinishes = ast.PredicateSym{":interval:finishes", 2}
+	// IntervalEquals checks if intervals T1 and T2 are identical.
+	IntervalEquals = ast.PredicateSym{":interval:equals", 2}
+
+	// Interval functions for extracting components from intervals
+
+	// IntervalStart extracts the start time from an interval.
+	IntervalStart = ast.FunctionSym{"fn:interval:start", 1}
+	// IntervalEnd extracts the end time from an interval.
+	IntervalEnd = ast.FunctionSym{"fn:interval:end", 1}
+	// IntervalDuration calculates the duration of an interval.
+	IntervalDuration = ast.FunctionSym{"fn:interval:duration", 1}
+
+	// Div is a family of functions mapping integer division: X,Y1,.. to (X / Y1) / Y2 ... DIV(X) is 1/x.
+	Div = ast.FunctionSym{"fn:div", -1}
+	// FloatDiv is a family of functions mapping division: X,Y1,.. to (X / Y1) / Y2 ... FloatDiv(X) is 1/x.
+	FloatDiv = ast.FunctionSym{"fn:float:div", -1}
+	// FloatMult is a family of functions mapping multiplication: X,Y1,.. to (X * Y1) * Y2 ... FloatMult(x) is x.
+	FloatMult = ast.FunctionSym{"fn:float:mult", -1}
+	// FloatPlus is a family of functions mapping addition: X,Y1,.. to (X + Y1) + Y2 ... FloatPlus(x) is x.
+	FloatPlus = ast.FunctionSym{"fn:float:plus", -1}
+	// Mod is a function mapping X,Y to X modulo Y. The result has the sign of X.
+	Mod = ast.FunctionSym{"fn:mod", 2}
+	// Mult is a family of functions mapping X,Y1,.. to (X * Y1) * Y2 ... MULT(x) is x.
+	Mult = ast.FunctionSym{"fn:mult", -1}
+	// Plus is a family of functions mapping X,Y1,.. to (X + Y1) + Y2 ... PLUS(x) is x.
+	Plus = ast.FunctionSym{"fn:plus", -1}
+	// Minus is a family of functions mapping X,Y1,.. to (X - Y1) - Y2 ...MINUS(x) is -X.
+	Minus = ast.FunctionSym{"fn:minus", -1}
+	// Sqrt returns the square root of a numeric argument.
+	Sqrt = ast.FunctionSym{"fn:sqrt", 1}
+
+	// Collect turns a collection { tuple_1,...tuple_n } into a list [tuple_1, ..., tuple_n].
+	Collect = ast.FunctionSym{"fn:collect", -1}
+	// CollectDistinct turns a collection { tuple_1,...tuple_n } into a list with distinct elements [tuple_1, ..., tuple_n].
+	CollectDistinct = ast.FunctionSym{"fn:collect_distinct", -1}
+	// CollectToMap turns a collection of key-value pairs into a map. Takes two arguments: the key variable and value variable.
+	// Example: project_languages(Project, Language) |> do fn:group_by(Project), let LanguageMap = fn:collect_to_map(Language, /true).
+	// If a keys is present multiple times, an arbitrary value will be picked.
+	CollectToMap = ast.FunctionSym{"fn:collect_to_map", 2}
+	// PickAny reduces a set { x_1,...x_n } to a single { x_i },
+	PickAny = ast.FunctionSym{"fn:pick_any", 1}
+	// Max reduces a set { x_1,...x_n } to { x_i } that is maximal.
+	Max = ast.FunctionSym{"fn:max", 1}
+	// FloatMax reduces a set of float64 { x_1,...x_n } to { x_i } that is maximal.
+	FloatMax = ast.FunctionSym{"fn:float:max", 1}
+	// DurationMax reduces a set of durations { x_1,...x_n } to { x_i } that is maximal.
+	DurationMax = ast.FunctionSym{"fn:duration:max", 1}
+	// TimeMax reduces a set of time instants { x_1,...x_n } to { x_i } that is maximal.
+	TimeMax = ast.FunctionSym{"fn:time:max", 1}
+	// Min reduces a set of numbers { x_1,...x_n } to { x_i } that is minimal.
+	Min = ast.FunctionSym{"fn:min", 1}
+	// FloatMin reduces a set of float64 { x_1,...x_n } to { x_i } that is minimal.
+	FloatMin = ast.FunctionSym{"fn:float:min", 1}
+	// DurationMin reduces a set of durations { x_1,...x_n } to { x_i } that is minimal.
+	DurationMin = ast.FunctionSym{"fn:duration:min", 1}
+	// TimeMin reduces a set of time instants { x_1,...x_n } to { x_i } that is minimal.
+	TimeMin = ast.FunctionSym{"fn:time:min", 1}
+	// Sum reduces a set of numbers { x_1,...x_n } to { x_1 + ... + x_n }.
+	Sum = ast.FunctionSym{"fn:sum", 1}
+	// FloatSum reduces a set of float64 { x_1,...x_n } to { x_1 + ... + x_n }.
+	FloatSum = ast.FunctionSym{"fn:float:sum", 1}
+	// DurationSum reduces a set of durations { x_1,...x_n } to { x_1 + ... + x_n }.
+	DurationSum = ast.FunctionSym{"fn:duration:sum", 1}
+	// Count reduces a set { x_1,...x_n } to { n }.
+	Count = ast.FunctionSym{"fn:count", 0}
+	// CountDistinct reduces a set { x_1,...x_n } to { m } with m being the
+	// number of unique elements.
+	CountDistinct = ast.FunctionSym{"fn:count_distinct", 0}
+	// Avg reduces a set { x_1,...x_n } to { fn:sum(x_1,...,x_n) /  n }.
+	Avg = ast.FunctionSym{"fn:avg", 1}
+
+	// GroupBy groups all tuples by the values of key variables, e.g. 'group_by(X)'.
+	// An empty group_by() treats the whole relation as a group.
+	GroupBy = ast.FunctionSym{"fn:group_by", -1}
+
+	// Append appends a element to a list.
+	Append = ast.FunctionSym{"fn:list:append", 2}
+
+	// ListGet is a function (List, Number) which returns element at index 'Number'.
+	ListGet = ast.FunctionSym{"fn:list:get", 2}
+
+	// ListContains is a function (List, Member) which returns /true if Member is contained in list.
+	ListContains = ast.FunctionSym{"fn:list:contains", 2}
+
+	// Len returns length of a list.
+	Len = ast.FunctionSym{"fn:list:len", 1}
+	// Cons constructs a pair.
+	Cons = ast.FunctionSym{"fn:list:cons", 2}
+	// Pair constructs a pair.
+	Pair = ast.FunctionSym{"fn:pair", 2}
+	// MapGet is a function (Map, Key) which returns element at key.
+	MapGet = ast.FunctionSym{"fn:map:get", 2}
+	// StructGet is a function (Struct, Field) which returns specified field.
+	StructGet = ast.FunctionSym{"fn:struct:get", 2}
+	// Tuple acts either as identity (one argument), pair (two arguments) or nested pair (more).
+	Tuple = ast.FunctionSym{"fn:tuple", -1}
+	// Some constructs an element of an option type.
+	Some = ast.FunctionSym{"fn:some", 1}
+	// List constructs a list.
+	List = ast.FunctionSym{"fn:list", -1}
+	// Map constructs a map.
+	Map = ast.FunctionSym{"fn:map", -1}
+	// Struct constructs a struct.
+	Struct = ast.FunctionSym{"fn:struct", -1}
+
+	// FunType is a constructor for a function type.
+	// fn:Fun(Res, Arg1, ..., ArgN) is Res <= Arg1, ..., ArgN
+	FunType = ast.FunctionSym{"fn:Fun", -1}
+	// RelType is a constructor for a relation type.
+	RelType = ast.FunctionSym{"fn:Rel", -1}
+	// SingletonType is a constructor for a singleton type.
+	SingletonType = ast.FunctionSym{"fn:Singleton", 1}
+	// NumberToString converts from ast.NumberType to ast.StringType
+	NumberToString = ast.FunctionSym{"fn:number:to_string", 1}
+	// Float64ToString converts from ast.Float64Type to ast.StringType
+	Float64ToString = ast.FunctionSym{"fn:float64:to_string", 1}
+	// NameToString converts from ast.NameType to ast.StringType
+	NameToString = ast.FunctionSym{"fn:name:to_string", 1}
+	// NameRoot returns the first name part of a name.
+	NameRoot = ast.FunctionSym{"fn:name:root", 1}
+	// NameTip returns the last name part of a name.
+	NameTip = ast.FunctionSym{"fn:name:tip", 1}
+	// NameList turns a name into a list of name parts.
+	NameList = ast.FunctionSym{"fn:name:list", 1}
+	// StringConcatenate concatenates the arguments into a single string constant.
+	StringConcatenate = ast.FunctionSym{"fn:string:concat", -1}
+	// StringReplace replaces old with new in the first n occurrences of a string.
+	StringReplace = ast.FunctionSym{"fn:string:replace", 4}
+
+	// Time functions
+
+	// TimeNow returns the current time as nanoseconds since Unix epoch.
+	TimeNow = ast.FunctionSym{"fn:time:now", 0}
+	// TimeAdd adds a duration to a time instant: fn:time:add(Time, Duration) -> Time
+	TimeAdd = ast.FunctionSym{"fn:time:add", 2}
+	// TimeAddCivil adds N calendar units to a time in a given timezone:
+	// fn:time:add_civil(Time, TimeZone, N, UnitName) -> Time
+	TimeAddCivil = ast.FunctionSym{"fn:time:add_civil", 4}
+	// TimeSub subtracts two time instants: fn:time:sub(Time1, Time2) -> Duration
+	TimeSub = ast.FunctionSym{"fn:time:sub", 2}
+	// TimeFormat formats a time instant using a pattern: fn:time:format(Time, Pattern) -> String
+	// Pattern uses Go time format (e.g., "2006-01-02T15:04:05Z07:00" for RFC3339)
+	TimeFormat = ast.FunctionSym{"fn:time:format", 2}
+	// TimeFormatCivil formats a time instant in a given timezone: fn:time:format_civil(Time, TimeZone, Pattern) -> String
+	TimeFormatCivil = ast.FunctionSym{"fn:time:format_civil", 3}
+	// TimeParseRFC3339 parses a string into a time instant: fn:time:parse_rfc3339(String) -> Time
+	TimeParseRFC3339 = ast.FunctionSym{"fn:time:parse_rfc3339", 1}
+	// TimeParseCivil parses a civil time string in a given timezone: fn:time:parse_civil(String, TimeZone) -> Time
+	TimeParseCivil = ast.FunctionSym{"fn:time:parse_civil", 2}
+	// TimeYear extracts the year from a time instant.
+	TimeYear = ast.FunctionSym{"fn:time:year", 1}
+	// TimeMonth extracts the month (1-12) from a time instant.
+	TimeMonth = ast.FunctionSym{"fn:time:month", 1}
+	// TimeDay extracts the day of month (1-31) from a time instant.
+	TimeDay = ast.FunctionSym{"fn:time:day", 1}
+	// TimeHour extracts the hour (0-23) from a time instant.
+	TimeHour = ast.FunctionSym{"fn:time:hour", 1}
+	// TimeMinute extracts the minute (0-59) from a time instant.
+	TimeMinute = ast.FunctionSym{"fn:time:minute", 1}
+	// TimeSecond extracts the second (0-59) from a time instant.
+	TimeSecond = ast.FunctionSym{"fn:time:second", 1}
+	// TimeFromUnixNanos converts nanoseconds since epoch to a time instant.
+	TimeFromUnixNanos = ast.FunctionSym{"fn:time:from_unix_nanos", 1}
+	// TimeToUnixNanos converts a time instant to nanoseconds since epoch.
+	TimeToUnixNanos = ast.FunctionSym{"fn:time:to_unix_nanos", 1}
+	// TimeTrunc truncates a time to a given fixed-duration unit (in UTC).
+	TimeTrunc = ast.FunctionSym{"fn:time:trunc", 2}
+	// TimeTruncCivil truncates a time to the start of a calendar unit in a
+	// given timezone: fn:time:trunc_civil(Time, TimeZone, UnitName) -> Time
+	TimeTruncCivil = ast.FunctionSym{"fn:time:trunc_civil", 3}
+	// TimeWeekdayCivil returns the ISO day of the week (Monday=1 … Sunday=7) for a
+	// time instant, evaluated in a given timezone:
+	// fn:time:weekday_civil(Time, TimeZone) -> Number
+	TimeWeekdayCivil = ast.FunctionSym{"fn:time:weekday_civil", 2}
+
+	// Duration functions
+
+	// DurationAdd adds two durations: fn:duration:add(D1, D2) -> Duration
+	DurationAdd = ast.FunctionSym{"fn:duration:add", 2}
+	// DurationMult multiplies a duration by a number: fn:duration:mult(Duration, Number) -> Duration
+	DurationMult = ast.FunctionSym{"fn:duration:mult", 2}
+	// DurationHours returns the duration as floating-point hours.
+	DurationHours = ast.FunctionSym{"fn:duration:hours", 1}
+	// DurationMinutes returns the duration as floating-point minutes.
+	DurationMinutes = ast.FunctionSym{"fn:duration:minutes", 1}
+	// DurationSeconds returns the duration as floating-point seconds.
+	DurationSeconds = ast.FunctionSym{"fn:duration:seconds", 1}
+	// DurationNanos returns the duration as nanoseconds (int64).
+	DurationNanos = ast.FunctionSym{"fn:duration:nanos", 1}
+	// DurationFromNanos creates a duration from nanoseconds.
+	DurationFromNanos = ast.FunctionSym{"fn:duration:from_nanos", 1}
+	// DurationFromHours creates a duration from hours.
+	DurationFromHours = ast.FunctionSym{"fn:duration:from_hours", 1}
+	// DurationFromMinutes creates a duration from minutes.
+	DurationFromMinutes = ast.FunctionSym{"fn:duration:from_minutes", 1}
+	// DurationFromSeconds creates a duration from seconds.
+	DurationFromSeconds = ast.FunctionSym{"fn:duration:from_seconds", 1}
+	// DurationParse parses a Go-style duration string like "1h30m", "500ms", "2h45m30s".
+	// Format: [+-]<value><unit>[<value><unit>...]
+	// Units: h (hours), m (minutes), s (seconds), ms (milliseconds), us/µs (microseconds), ns (nanoseconds)
+	DurationParse = ast.FunctionSym{"fn:duration:parse", 1}
+
+	// PairType is a constructor for a pair type.
+	PairType = ast.FunctionSym{"fn:Pair", 2}
+	// TupleType is a type-level function that returns a tuple type out of pair types.
+	TupleType = ast.FunctionSym{"fn:Tuple", -1}
+	// OptionType is a constructor for an option type.
+	// A value of fn:Option(T) is either fn:some(c) for c:T, or fn:none().
+	// TODO: Implement runtime representation.
+	OptionType = ast.FunctionSym{"fn:Option", 1}
+	// ListType is a constructor for a list type.
+	ListType = ast.FunctionSym{"fn:List", 1}
+	// MapType is a constructor for a map type.
+	MapType = ast.FunctionSym{"fn:Map", 2}
+	// StructType is a constructor for a struct type.
+	StructType = ast.FunctionSym{"fn:Struct", -1}
+	// UnionType is a constructor for a union type.
+	UnionType = ast.FunctionSym{"fn:Union", -1}
+	// TaggedUnionType is a constructor for a tagged union (internally-tagged discriminated union).
+	// fn:TaggedUnion(tag_field, tag1, struct_type1, tag2, struct_type2, ...)
+	// A value is a struct with the tag field set to a variant tag, plus the variant's fields.
+	TaggedUnionType = ast.FunctionSym{"fn:TaggedUnion", -1}
+
+	// Optional may appear inside StructType to indicate optional fields.
+	Optional = ast.FunctionSym{"fn:opt", -1}
+
+	// Package is an improper symbol, used to represent package declaration.
+	Package = ast.PredicateSym{"Package", 0}
+	// Use is an improper symbol, used to represent use declaration.
+	Use = ast.PredicateSym{"Use", 0}
+
+	// TypeConstructors is a list of function symbols used in structured type expressions.
+	// Each name is mapped to the corresponding type constructor (a function at the level of types).
+	TypeConstructors = map[string]ast.FunctionSym{
+		UnionType.Symbol:       UnionType,
+		SingletonType.Symbol:   SingletonType,
+		ListType.Symbol:        ListType,
+		OptionType.Symbol:      OptionType,
+		PairType.Symbol:        PairType,
+		TupleType.Symbol:       TupleType,
+		MapType.Symbol:         MapType,
+		StructType.Symbol:      StructType,
+		TaggedUnionType.Symbol: TaggedUnionType,
+		FunType.Symbol:         FunType,
+		RelType.Symbol:         RelType,
+	}
+
+	// EmptyType is a type without members.
+	// TODO: replace with /bot
+	EmptyType = ast.ApplyFn{UnionType, nil}
+
+	// BuiltinRelations maps each builtin predicate to its argument range list
+	BuiltinRelations = map[ast.PredicateSym]ast.BaseTerm{
+		MatchPrefix: NewRelType(ast.NameBound, ast.NameBound),
+		StartsWith:  NewRelType(ast.StringBound, ast.StringBound),
+		EndsWith:    NewRelType(ast.StringBound, ast.StringBound),
+		Contains:    NewRelType(ast.StringBound, ast.StringBound),
+		Filter:      NewRelType(BoolType()),
+		// Numeric comparisons are split by base type: :lt/:le/:gt/:ge operate on
+		// /number (int64), :float:lt/:float:le/:float:gt/:float:ge on /float64,
+		// :time:* on /time, and :duration:* on /duration.
+		Lt: NewRelType(ast.NumberBound, ast.NumberBound),
+		Le: NewRelType(ast.NumberBound, ast.NumberBound),
+		Gt: NewRelType(ast.NumberBound, ast.NumberBound),
+		Ge: NewRelType(ast.NumberBound, ast.NumberBound),
+		// Time comparisons
+		TimeLt: NewRelType(ast.TimeBound, ast.TimeBound),
+		TimeLe: NewRelType(ast.TimeBound, ast.TimeBound),
+		TimeGt: NewRelType(ast.TimeBound, ast.TimeBound),
+		TimeGe: NewRelType(ast.TimeBound, ast.TimeBound),
+		// Duration comparisons
+		DurationLt: NewRelType(ast.DurationBound, ast.DurationBound),
+		DurationLe: NewRelType(ast.DurationBound, ast.DurationBound),
+		DurationGt: NewRelType(ast.DurationBound, ast.DurationBound),
+		DurationGe: NewRelType(ast.DurationBound, ast.DurationBound),
+		// Float64 comparisons
+		FloatLt: NewRelType(ast.Float64Bound, ast.Float64Bound),
+		FloatLe: NewRelType(ast.Float64Bound, ast.Float64Bound),
+		FloatGt: NewRelType(ast.Float64Bound, ast.Float64Bound),
+		FloatGe: NewRelType(ast.Float64Bound, ast.Float64Bound),
+		MatchNil:   NewRelType(NewListType(ast.Variable{"X"})),
+		MatchCons: NewRelType(
+			NewListType(ast.Variable{"X"}), ast.Variable{"X"}, NewListType(ast.Variable{"X"})),
+		MatchPair: NewRelType(
+			NewPairType(ast.Variable{"X"}, ast.Variable{"Y"}), ast.Variable{"X"}, ast.Variable{"Y"}),
+		MatchEntry: NewRelType(
+			NewMapType(ast.AnyBound, ast.AnyBound), ast.AnyBound),
+		// Note: :match_field is treated specially, the following type is only a fallback.
+		MatchField: NewRelType(
+			ast.AnyBound, ast.NameBound, ast.AnyBound),
+		ListMember: NewRelType(ast.Variable{"X"}, NewListType(ast.Variable{"X"})),
+		// Temporal interval predicates
+		IntervalBefore:   NewRelType(NewPairType(ast.TimeBound, ast.TimeBound), NewPairType(ast.TimeBound, ast.TimeBound)),
+		IntervalAfter:    NewRelType(NewPairType(ast.TimeBound, ast.TimeBound), NewPairType(ast.TimeBound, ast.TimeBound)),
+		IntervalMeets:    NewRelType(NewPairType(ast.TimeBound, ast.TimeBound), NewPairType(ast.TimeBound, ast.TimeBound)),
+		IntervalOverlaps: NewRelType(NewPairType(ast.TimeBound, ast.TimeBound), NewPairType(ast.TimeBound, ast.TimeBound)),
+		IntervalDuring:   NewRelType(NewPairType(ast.TimeBound, ast.TimeBound), NewPairType(ast.TimeBound, ast.TimeBound)),
+		IntervalContains: NewRelType(NewPairType(ast.TimeBound, ast.TimeBound), NewPairType(ast.TimeBound, ast.TimeBound)),
+		IntervalStarts:   NewRelType(NewPairType(ast.TimeBound, ast.TimeBound), NewPairType(ast.TimeBound, ast.TimeBound)),
+		IntervalFinishes: NewRelType(NewPairType(ast.TimeBound, ast.TimeBound), NewPairType(ast.TimeBound, ast.TimeBound)),
+		IntervalEquals:   NewRelType(NewPairType(ast.TimeBound, ast.TimeBound), NewPairType(ast.TimeBound, ast.TimeBound)),
+	}
+
+	errTypeMismatch = errors.New("type mismatch")
+)
+
+// TypeHandle provides functionality related to type expression.
+type TypeHandle struct {
+	expr ast.BaseTerm
+	ctx  map[ast.Variable]ast.BaseTerm
+}
+
+// NewBoundHandle constructs a TypeHandle for a bound (may contain type variables).
+func NewBoundHandle(expr ast.BaseTerm) (TypeHandle, error) {
+	typeVars := make(map[ast.Variable]bool)
+	ast.AddVars(expr, typeVars)
+	ctx := make(map[ast.Variable]ast.BaseTerm)
+	for v := range typeVars {
+		// TODO: This is wrong. At this stage, we would need to not only collect
+		// type variables but also infer upper and lower type bounds. The context
+		// has to map type variables to type constraints.
+		ctx[v] = ast.Variable{"_"}
+	}
+	return NewTypeHandle(ctx, expr)
+}
+
+// NewSetHandle constructs a TypeHandle for a (simple) monotype.
+func NewSetHandle(expr ast.BaseTerm) (TypeHandle, error) {
+	return NewTypeHandle(nil, expr)
+}
+
+// NewTypeHandle constructs a TypeHandle.
+func NewTypeHandle(ctx map[ast.Variable]ast.BaseTerm, expr ast.BaseTerm) (TypeHandle, error) {
+	if err := WellformedType(ctx, expr); err != nil {
+		return TypeHandle{}, err
+	}
+	return TypeHandle{expr, ctx}, nil
+}
+
+// String returns a string represented of this type expression.
+func (t TypeHandle) String() string {
+	return t.expr.String()
+}
+
+// HasType returns true if c has type represented by this TypeHandle.
+func (t TypeHandle) HasType(c ast.Constant) bool {
+	if baseType, ok := t.expr.(ast.Constant); ok {
+		return hasBaseType(baseType, c)
+	}
+	tpe, ok := t.expr.(ast.ApplyFn)
+	if !ok {
+		return false // This never happens.
+	}
+	switch tpe.Function {
+	case PairType:
+		fst, snd, err := c.PairValue()
+		if err != nil {
+			return false
+		}
+		return TypeHandle{tpe.Args[0], t.ctx}.HasType(fst) &&
+			TypeHandle{tpe.Args[1], t.ctx}.HasType(snd)
+	case ListType:
+		elementType := TypeHandle{tpe.Args[0], t.ctx}
+		shapeErr, err := c.ListValues(func(e ast.Constant) error {
+			if !elementType.HasType(e) {
+				return errTypeMismatch
+			}
+			return nil
+		}, func() error {
+			return nil
+		})
+		if shapeErr != nil {
+			return false // not a list.
+		}
+		if errors.Is(err, errTypeMismatch) {
+			return false
+		}
+		return true
+	case TupleType:
+		return TypeHandle{expandTupleType(tpe.Args), t.ctx}.HasType(c)
+	case MapType:
+		if c.IsMapNil() {
+			return true
+		}
+		keyTpe := TypeHandle{tpe.Args[0], t.ctx}
+		valTpe := TypeHandle{tpe.Args[1], t.ctx}
+		e, err := c.MapValues(func(key ast.Constant, val ast.Constant) error {
+			if keyTpe.HasType(key) && valTpe.HasType(val) {
+				return nil
+			}
+			return errTypeMismatch
+		}, func() error {
+			return nil
+		})
+		return e == nil && err == nil
+	case StructType:
+		if c.IsStructNil() {
+			return len(tpe.Args) == 0
+		}
+		fieldTpeMap := make(map[ast.Constant]TypeHandle)
+		requiredArgs, err := StructTypeRequiredArgs(tpe)
+		if err != nil {
+			return false
+		}
+		for i := 0; i < len(requiredArgs); i++ {
+			key := requiredArgs[i].(ast.Constant)
+			i++
+			val := requiredArgs[i]
+			fieldTpeMap[key] = TypeHandle{val, t.ctx}
+		}
+		optArgs, err := StructTypeOptionaArgs(tpe)
+		if err != nil {
+			return false
+		}
+		for _, optArg := range optArgs {
+			f := optArg.(ast.ApplyFn)
+			fieldTpeMap[f.Args[0].(ast.Constant)] = TypeHandle{f.Args[1], t.ctx}
+		}
+		seen := make(map[ast.Constant]bool)
+		e, err := c.StructValues(func(key ast.Constant, val ast.Constant) error {
+			fieldTpe, ok := fieldTpeMap[key]
+			if !ok {
+				return errTypeMismatch
+			}
+			seen[key] = true
+			if !fieldTpe.HasType(val) {
+				return errTypeMismatch
+			}
+			return nil
+		}, func() error {
+			return nil
+		})
+		return e == nil && err == nil && len(fieldTpeMap) == len(seen)
+	case UnionType:
+		for _, arg := range tpe.Args {
+			alt := TypeHandle{arg, t.ctx}
+			if alt.HasType(c) {
+				return true
+			}
+		}
+		return false
+	case SingletonType:
+		d := tpe.Args[0]
+		return c.Equals(d)
+	case TaggedUnionType:
+		expanded, err := ExpandTaggedUnionType(tpe)
+		if err != nil {
+			return false
+		}
+		return TypeHandle{expanded, t.ctx}.HasType(c)
+	}
+	return false
+}
+
+func hasBaseType(typeExpr ast.Constant, c ast.Constant) bool {
+	switch typeExpr {
+	case ast.AnyBound:
+		return true
+	case ast.Float64Bound:
+		return c.Type == ast.Float64Type
+	case ast.NameBound:
+		return c.Type == ast.NameType
+	case ast.NumberBound:
+		return c.Type == ast.NumberType
+	case ast.StringBound:
+		return c.Type == ast.StringType
+	case ast.TimeBound:
+		return c.Type == ast.TimeType
+	case ast.DurationBound:
+		return c.Type == ast.DurationType
+	default:
+		return typeExpr.Type == ast.NameType && c.Type == ast.NameType && strings.HasPrefix(c.Symbol, typeExpr.Symbol+"/")
+	}
+}
+
+// WellformedBound returns an error if expr is not a valid bound expression.
+//
+// A bound expression is well formed if the type-in-context that is formed by
+// closing over its type variables is a well-formed type expression.
+//
+// An unconstrained type variable still counts as a well-formed bound expression.
+// If it is not constrained by type expressions in the other bounds, it will
+// be treated as /any.
+func WellformedBound(expr ast.BaseTerm) error {
+	typeVars := make(map[ast.Variable]bool)
+	ast.AddVars(expr, typeVars)
+	ctx := make(map[ast.Variable]ast.BaseTerm)
+	for v := range typeVars {
+		// We get away with this because well-formedness checking does not
+		// consider constraints.
+		ctx[v] = ast.Variable{"_"}
+	}
+	return WellformedType(ctx, expr)
+}
+
+// WellformedType returns an error if expr is not a well-formed type-in-context.
+// expr is by convention not a reltype.
+func WellformedType(ctx map[ast.Variable]ast.BaseTerm, expr ast.BaseTerm) error {
+	switch expr := expr.(type) {
+	case ast.Constant:
+		if IsBaseTypeExpression(expr) || expr.Type == ast.NameType {
+			return nil
+		}
+		return fmt.Errorf("not a base type expression: %v", expr)
+	case ast.Variable:
+		if ctx == nil || ctx[expr] == nil {
+			return fmt.Errorf("unexpected type variable: %v context: %v", expr, ctx)
+		}
+		return nil
+
+	case ast.ApplyFn:
+		fn, ok := TypeConstructors[expr.Function.Symbol]
+		if !ok {
+			return fmt.Errorf("not a structured type expression: %v", expr)
+		}
+		args := expr.Args
+		if fn == FunType {
+			return CheckFunTypeExpression(ctx, expr)
+		}
+		if fn.Arity != -1 && len(args) != fn.Arity {
+			return fmt.Errorf("expected %d arguments in type expression %v ", fn.Arity, expr)
+		}
+		if fn == UnionType && len(args) <= 0 {
+			return fmt.Errorf("union type must not be empty %v ", expr)
+		}
+		if fn == TupleType && len(args) <= 2 {
+			return fmt.Errorf("tuple type must have more than 2 args %v ", expr)
+		}
+		if fn == StructType {
+			requiredArgs, err := StructTypeRequiredArgs(expr)
+			if err != nil {
+				return err
+			}
+			if len(requiredArgs)%2 != 0 {
+				return fmt.Errorf("struct type must have even number of required arguments %v ", expr)
+			}
+			for i := 0; i < len(requiredArgs); i++ {
+				key := requiredArgs[i]
+				if c, ok := key.(ast.Constant); !ok || c.Type != ast.NameType {
+					return fmt.Errorf("in a struct type expression, odd arguments must be name constants, argument %d (%v) is not %v ", i, key, expr)
+				}
+				i++
+				tpe := requiredArgs[i]
+				if err := WellformedType(ctx, tpe); err != nil {
+					return fmt.Errorf("in a struct type expression %v : %w", expr, err)
+				}
+			}
+			return nil
+		}
+		if fn == TaggedUnionType {
+			return CheckTaggedUnionTypeExpression(ctx, expr)
+		}
+
+		for _, arg := range args {
+			if err := WellformedType(ctx, arg); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("CheckTypeExpression: unexpected case %v %T", expr, expr)
+	}
+}
+
+// CheckFunTypeExpression checks a function type expression.
+func CheckFunTypeExpression(ctx map[ast.Variable]ast.BaseTerm, expr ast.ApplyFn) error {
+	if len(expr.Args) == 0 {
+		return fmt.Errorf("expected at least 1 argument in function type expression %v ", expr)
+	}
+	codomain := expr.Args[0]
+	argTpes := expr.Args[1:]
+	vars := make(map[ast.Variable]bool)
+	for _, arg := range argTpes {
+		ast.AddVars(arg, vars)
+	}
+	codomainVars := make(map[ast.Variable]bool)
+	ast.AddVars(codomain, codomainVars)
+	// Check inclusion.
+	for v := range codomainVars {
+		if vars[v] {
+			continue
+		}
+		return fmt.Errorf("type variable %v not in domain vars %v ", v, vars)
+	}
+
+	ctxMap := make(map[ast.Variable]ast.BaseTerm)
+	for v := range vars {
+		ctxMap[v] = ast.AnyBound
+	}
+	for _, argTpe := range argTpes {
+		if err := WellformedType(ctxMap, argTpe); err != nil {
+			return err
+		}
+	}
+	return WellformedType(ctxMap, codomain)
+}
+
+// CheckTaggedUnionTypeExpression checks a tagged union type expression.
+// fn:TaggedUnion(tag_field, tag1, struct_type1, tag2, struct_type2, ...)
+func CheckTaggedUnionTypeExpression(ctx map[ast.Variable]ast.BaseTerm, expr ast.ApplyFn) error {
+	args := expr.Args
+	if len(args) < 3 || len(args)%2 != 1 {
+		return fmt.Errorf("tagged union type must have odd number of args >= 3 (tag_field, tag1, type1, ...), got %d in %v", len(args), expr)
+	}
+	tagField, ok := args[0].(ast.Constant)
+	if !ok || tagField.Type != ast.NameType {
+		return fmt.Errorf("tagged union tag field must be a name constant, got %v in %v", args[0], expr)
+	}
+	seenTags := make(map[string]bool)
+	for i := 1; i < len(args); i += 2 {
+		tag, ok := args[i].(ast.Constant)
+		if !ok || tag.Type != ast.NameType {
+			return fmt.Errorf("tagged union variant tag must be a name constant, got %v in %v", args[i], expr)
+		}
+		if seenTags[tag.Symbol] {
+			return fmt.Errorf("duplicate variant tag %v in %v", tag, expr)
+		}
+		seenTags[tag.Symbol] = true
+
+		variantType := args[i+1]
+		if !IsStructTypeExpression(variantType) {
+			return fmt.Errorf("tagged union variant type must be a struct type, got %v in %v", variantType, expr)
+		}
+		if err := WellformedType(ctx, variantType); err != nil {
+			return fmt.Errorf("in tagged union variant %v: %w", tag, err)
+		}
+		// Check that the tag field does not appear in the variant struct.
+		requiredArgs, err := StructTypeRequiredArgs(variantType)
+		if err != nil {
+			return err
+		}
+		for j := 0; j < len(requiredArgs); j += 2 {
+			if key, ok := requiredArgs[j].(ast.Constant); ok && key.Symbol == tagField.Symbol {
+				return fmt.Errorf("variant %v must not contain tag field %v in %v", tag, tagField, expr)
+			}
+		}
+		optArgs, err := StructTypeOptionaArgs(variantType)
+		if err != nil {
+			return err
+		}
+		for _, optArg := range optArgs {
+			if f, ok := optArg.(ast.ApplyFn); ok {
+				if key, ok := f.Args[0].(ast.Constant); ok && key.Symbol == tagField.Symbol {
+					return fmt.Errorf("variant %v must not contain tag field %v in %v", tag, tagField, expr)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// SetConforms returns true if |- left <: right for set expression.
+func SetConforms(typeCtx map[ast.Variable]ast.BaseTerm, left ast.BaseTerm, right ast.BaseTerm) bool {
+	if left.Equals(right) || right.Equals(ast.AnyBound) || left.Equals(ast.BotBound) {
+		return true
+	}
+	if leftTuple, ok := left.(ast.ApplyFn); ok && leftTuple.Function.Symbol == RelType.Symbol {
+		if rightTuple, ok := right.(ast.ApplyFn); ok && rightTuple.Function.Symbol == RelType.Symbol {
+			for i, leftArg := range leftTuple.Args {
+				if !SetConforms(typeCtx, leftArg, rightTuple.Args[i]) {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	leftApply, leftApplyOk := left.(ast.ApplyFn)
+	rightApply, rightApplyOk := right.(ast.ApplyFn)
+	// Expand tagged unions to union-of-structs before checking conformance.
+	if leftApplyOk && leftApply.Function.Symbol == TaggedUnionType.Symbol {
+		expanded, err := ExpandTaggedUnionType(leftApply)
+		if err != nil {
+			return false
+		}
+		return SetConforms(typeCtx, expanded, right)
+	}
+	if rightApplyOk && rightApply.Function.Symbol == TaggedUnionType.Symbol {
+		expanded, err := expandTaggedUnionForBounds(rightApply)
+		if err != nil {
+			return false
+		}
+		return SetConforms(typeCtx, left, expanded)
+	}
+	if leftApplyOk && leftApply.Function.Symbol == UnionType.Symbol {
+		for _, leftItem := range leftApply.Args {
+			if !SetConforms(typeCtx, leftItem, right) {
+				return false
+			}
+		}
+		return true
+	}
+	if rightApplyOk && rightApply.Function.Symbol == UnionType.Symbol {
+		for _, rightItem := range rightApply.Args {
+			if SetConforms(typeCtx, left, rightItem) {
+				return true
+			}
+		}
+	}
+
+	return TypeConforms(typeCtx, left, right)
+}
+
+// TypeConforms returns true if ctx |- left <: right.
+// The arguments left and right cannot be RelType or UnionType
+func TypeConforms(ctx map[ast.Variable]ast.BaseTerm, left ast.BaseTerm, right ast.BaseTerm) bool {
+	if left.Equals(right) || right.Equals(ast.AnyBound) || left.Equals(ast.BotBound) {
+		return true
+	}
+	if leftConst, ok := left.(ast.Constant); ok {
+		if rightConst, ok := right.(ast.Constant); ok {
+			if strings.HasPrefix(leftConst.Symbol, rightConst.Symbol) {
+				return true
+			}
+			return leftConst.Type == ast.NameType && rightConst.Equals(ast.NameBound)
+		}
+	}
+	// fn:Singleton(c) <: T if c is a member of T.
+	if leftApply, ok := left.(ast.ApplyFn); ok && leftApply.Function.Symbol == SingletonType.Symbol {
+		if c, ok := leftApply.Args[0].(ast.Constant); ok {
+			return (TypeHandle{right, ctx}).HasType(c)
+		}
+	}
+	if leftVar, ok := left.(ast.Variable); ok {
+		bound, ok := ctx[leftVar]
+		if !ok {
+			return true // Unknown type variable: conservatively assume conformance.
+		}
+		return TypeConforms(ctx, bound, right)
+	}
+	if rightVar, ok := right.(ast.Variable); ok {
+		bound, ok := ctx[rightVar]
+		if !ok {
+			return true // Unknown type variable: conservatively assume conformance.
+		}
+		return TypeConforms(ctx, left, bound)
+	}
+	leftApply, leftApplyOk := left.(ast.ApplyFn)
+	rightApply, rightApplyOk := right.(ast.ApplyFn)
+	if leftApplyOk && leftApply.Function.Symbol == FunType.Symbol &&
+		rightApplyOk && rightApply.Function.Symbol == FunType.Symbol {
+		// FunType subtyping is covariant in codomain, contravariant in domain
+		// E.g. /genus_species <: /name and /animal/bird <: /animal
+		// therefore FunType(/genus_species <= /animal) <: FunType(/name <= /animal/bird)
+		leftCodomain, rightCodomain := leftApply.Args[0], rightApply.Args[0]
+		if !TypeConforms(ctx, leftCodomain, rightCodomain) {
+			return false
+		}
+		leftDomain, rightDomain := leftApply.Args[1:], rightApply.Args[1:]
+
+		for i, leftArg := range leftDomain {
+			if !TypeConforms(ctx, rightDomain[i], leftArg) {
+				return false
+			}
+		}
+		return true
+	}
+
+	if leftApplyOk && leftApply.Function.Symbol == ListType.Symbol {
+		if rightApplyOk && rightApply.Function.Symbol == ListType.Symbol {
+			return TypeConforms(ctx, leftApply.Args[0], rightApply.Args[0])
+		}
+	}
+	if leftApplyOk && leftApply.Function.Symbol == MapType.Symbol {
+		if rightApplyOk && rightApply.Function.Symbol == MapType.Symbol {
+			return TypeConforms(ctx, rightApply.Args[0], leftApply.Args[0]) &&
+				TypeConforms(ctx, leftApply.Args[1], rightApply.Args[1])
+		}
+	}
+	if leftApplyOk && leftApply.Function.Symbol == StructType.Symbol {
+		if rightApplyOk && rightApply.Function.Symbol == StructType.Symbol {
+			leftRequired, err := StructTypeRequiredArgs(left)
+			if err != nil {
+				return false
+			}
+			rightRequired, err := StructTypeRequiredArgs(right)
+			if err != nil {
+				return false
+			}
+			if len(leftRequired) < len(rightRequired) {
+				return false
+			}
+			leftMap := make(map[string]ast.BaseTerm)
+			for i := 0; i < len(leftRequired); i++ {
+				leftKey, _ := leftRequired[i].(ast.Constant)
+				i++
+				leftMap[leftKey.Symbol] = leftRequired[i]
+			}
+
+			for j := 0; j < len(rightRequired); j++ {
+				rightKey, _ := rightRequired[j].(ast.Constant)
+				j++
+				rightTpe := rightRequired[j]
+				leftTpe, ok := leftMap[rightKey.Symbol]
+				if !ok || !TypeConforms(ctx, leftTpe, rightTpe) {
+					return false
+				}
+			}
+			leftOpt, err := StructTypeOptionaArgs(left)
+			if err != nil {
+				return false
+			}
+			rightOpt, err := StructTypeOptionaArgs(right)
+			if err != nil {
+				return false
+			}
+			leftOptMap := make(map[string]ast.BaseTerm)
+			for _, opt := range leftOpt {
+				optApply, ok := opt.(ast.ApplyFn)
+				if !ok {
+					return false
+				}
+				leftOptMap[optApply.Args[0].(ast.Constant).Symbol] = optApply.Args[1]
+			}
+			for _, opt := range rightOpt {
+				optApply, ok := opt.(ast.ApplyFn)
+				if !ok {
+					return false
+				}
+				key := optApply.Args[0].(ast.Constant).Symbol
+				rightTpe := optApply.Args[1]
+				leftTpe, ok := leftMap[key]
+				if ok && !TypeConforms(ctx, leftTpe, rightTpe) {
+					return false
+				}
+				if !ok {
+					leftTpe, ok := leftOptMap[key]
+					if ok && !TypeConforms(ctx, leftTpe, rightTpe) {
+						return false
+					}
+				}
+			}
+			return true
+		}
+	}
+
+	if leftApplyOk && leftApply.Function.Symbol == PairType.Symbol {
+		if rightApplyOk && rightApply.Function.Symbol == PairType.Symbol {
+			return TypeConforms(ctx, leftApply.Args[0], rightApply.Args[0]) &&
+				TypeConforms(ctx, leftApply.Args[1], rightApply.Args[1])
+		}
+	}
+	if leftTuple, ok := left.(ast.ApplyFn); ok && leftTuple.Function.Symbol == TupleType.Symbol {
+		if rightTuple, ok := right.(ast.ApplyFn); ok && rightTuple.Function.Symbol == TupleType.Symbol {
+			for i, leftArg := range leftTuple.Args {
+				if !TypeConforms(ctx, leftArg, rightTuple.Args[i]) {
+					return false
+				}
+			}
+			return true
+		}
+	}
+
+	return false
+}
+
+func expandTupleType(args []ast.BaseTerm) ast.BaseTerm {
+	res := NewPairType(args[len(args)-2], args[len(args)-1])
+	for j := len(args) - 3; j >= 0; j-- {
+		res = NewPairType(args[j], res)
+	}
+	return res
+}
+
+// UpperBound returns upper bound of set expressions.
+func UpperBound(typeCtx map[ast.Variable]ast.BaseTerm, typeExprs []ast.BaseTerm) ast.BaseTerm {
+	var worklist []ast.BaseTerm
+	for _, typeExpr := range typeExprs {
+		if ast.AnyBound.Equals(typeExpr) {
+			return ast.AnyBound
+		}
+		if union, ok := typeExpr.(ast.ApplyFn); ok && union.Function == UnionType {
+			worklist = append(worklist, union.Args...)
+			continue
+		}
+		worklist = append(worklist, typeExpr)
+	}
+	if len(worklist) == 0 {
+		return EmptyType
+	}
+	reduced := []ast.BaseTerm{worklist[0]}
+	worklist = worklist[1:]
+typeExprLoop:
+	for _, typeExpr := range worklist {
+		for i, existing := range reduced {
+			if SetConforms(typeCtx, typeExpr, existing) {
+				continue typeExprLoop
+			}
+			if SetConforms(typeCtx, existing, typeExpr) {
+				reduced[i] = typeExpr
+				continue typeExprLoop
+			}
+		}
+		reduced = append(reduced, typeExpr)
+	}
+	if len(reduced) == 1 {
+		return reduced[0]
+	}
+	sort.Slice(reduced, func(i, j int) bool { return reduced[i].Hash() < reduced[j].Hash() })
+	return ast.ApplyFn{UnionType, reduced}
+}
+
+func intersectType(typeCtx map[ast.Variable]ast.BaseTerm, a, b ast.BaseTerm) ast.BaseTerm {
+	if a.Equals(b) {
+		return a
+	}
+	if a.Equals(ast.AnyBound) {
+		return b
+	}
+	if b.Equals(ast.AnyBound) {
+		return a
+	}
+	if typeVar, ok := a.(ast.Variable); ok {
+		bound, ok := typeCtx[typeVar]
+		if !ok {
+			return EmptyType
+		}
+		return intersectType(typeCtx, bound, b)
+	}
+	if typeVar, ok := b.(ast.Variable); ok {
+		bound, ok := typeCtx[typeVar]
+		if !ok {
+			return EmptyType
+		}
+		return intersectType(typeCtx, a, bound)
+	}
+	if SetConforms(typeCtx, a, b) {
+		return a
+	}
+	if SetConforms(typeCtx, b, a) {
+		return b
+	}
+	if aUnion, ok := a.(ast.ApplyFn); ok && aUnion.Function == UnionType {
+		var res []ast.BaseTerm
+		for _, elem := range aUnion.Args {
+			if u := intersectType(typeCtx, elem, b); !u.Equals(EmptyType) {
+				res = append(res, u)
+			}
+		}
+		return UpperBound(typeCtx, res)
+	}
+	if bUnion, ok := b.(ast.ApplyFn); ok && bUnion.Function == UnionType {
+		var res []ast.BaseTerm
+		for _, elem := range bUnion.Args {
+			if SetConforms(typeCtx, a, elem) {
+				res = append(res, a)
+			} else if SetConforms(typeCtx, elem, a) {
+				res = append(res, elem)
+			}
+		}
+		return UpperBound(typeCtx, res)
+	}
+
+	return EmptyType
+}
+
+// LowerBound returns a lower bound of set expressions.
+func LowerBound(typeCtx map[ast.Variable]ast.BaseTerm, typeExprs []ast.BaseTerm) ast.BaseTerm {
+	var typeExpr ast.BaseTerm = ast.AnyBound
+	for _, t := range typeExprs {
+		if typeExpr = intersectType(typeCtx, typeExpr, t); typeExpr.Equals(EmptyType) {
+			return EmptyType
+		}
+	}
+	return typeExpr
+}
+
+// CreateListType applies given type to a list.
+func CreateListType(bound ast.Constant) ast.ApplyFn {
+	return ast.ApplyFn{ListType, []ast.BaseTerm{bound}}
+}

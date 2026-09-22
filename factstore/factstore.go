@@ -1,0 +1,1019 @@
+// Copyright 2022 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package factstore contains the interface and a simple implementation for access
+// to facts (atoms that are ground, i.e. contain no variables).
+package factstore
+
+import (
+	"strings"
+	"sync"
+
+	"codeberg.org/TauCeti/mangle-go/ast"
+)
+
+// ReadOnlyFactStore provides read access to a set of facts.
+type ReadOnlyFactStore interface {
+	// Returns a stream of facts that match a given atom. It takes a callback
+	// to process results. If the callback returns an error, or it encounters
+	// a malformed atom, scanning stops and that error is returned.
+	GetFacts(ast.Atom, func(ast.Atom) error) error
+
+	// Contains returns true if given atom is already present in store.
+	// This is a convenience method that has a straightforward implementation
+	// in terms of GetFacts. It does not return error and treats any
+	// error condition as "false". Clients who distinguish "absent" from "error"
+	// should call GetFacts directly.
+	Contains(ast.Atom) bool
+
+	// ListPredicates lists predicates available in this store.
+	ListPredicates() []ast.PredicateSym
+
+	// EstimateFactCount returns the estimated number of facts in the store.
+	EstimateFactCount() int
+}
+
+// FactStore provides access to a set of facts.
+type FactStore interface {
+	ReadOnlyFactStore
+
+	// Add adds a fact to the store and returns true if it didn't exist before.
+	Add(ast.Atom) bool
+
+	// Merge merges contents of given store.
+	Merge(ReadOnlyFactStore)
+}
+
+// GetAllFacts streams all facts in a store.
+func GetAllFacts(fs FactStore, fn func(ast.Atom) error) error {
+	for _, pred := range fs.ListPredicates() {
+		if err := fs.GetFacts(ast.NewQuery(pred), fn); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// FactStoreWithRemove is a FactStore that supports fact removal.
+//
+// This low-level functionality is intended to be used by the engine,
+// to be invoked for facts that can be removed safely.
+//
+// If this factstore contains the result of evaluating rules, beware that
+// removing a fact may lose the property that all facts are either
+// from the extensional database or consequences of applying rules.
+//
+// Also, implementations that are backed by readonly store may not properly
+// support removing facts from those stores.
+type FactStoreWithRemove interface {
+	FactStore
+
+	// Removes a fact from the store and returns true if that fact was present.
+	Remove(ast.Atom) bool
+}
+
+// InMemoryStore provides a simple implementation backed by a map from each predicate sym to a T value.
+type InMemoryStore[T any] struct {
+	constants         map[ast.PredicateSym]ast.Atom
+	shardsByPredicate map[ast.PredicateSym]T
+}
+
+// NewInMemoryStore constructs a new InMemoryStore.
+func NewInMemoryStore[T any]() InMemoryStore[T] {
+	return InMemoryStore[T]{
+		make(map[ast.PredicateSym]ast.Atom),
+		make(map[ast.PredicateSym]T),
+	}
+}
+
+// SimpleInMemoryStore provides a simple implementation backed by a two-level map.
+// For each predicate sym, we have a separate map, using numeric hash as key.
+type SimpleInMemoryStore struct {
+	InMemoryStore[map[uint64]ast.Atom]
+}
+
+var _ FactStoreWithRemove = SimpleInMemoryStore{}
+
+// String returns a readable debug string for this store.
+func (s SimpleInMemoryStore) String() string {
+	var sb strings.Builder
+	for _, m := range s.shardsByPredicate {
+		for _, v := range m {
+			sb.WriteString(v.String())
+			sb.WriteRune(' ')
+		}
+		sb.WriteRune('\n')
+	}
+	return sb.String()
+}
+
+// ListPredicates returns a list of predicates.
+func (s SimpleInMemoryStore) ListPredicates() []ast.PredicateSym {
+	var r []ast.PredicateSym
+	for p := range s.shardsByPredicate {
+		r = append(r, p)
+	}
+	return r
+}
+
+// NewSimpleInMemoryStore constructs a new SimpleInMemoryStore.
+func NewSimpleInMemoryStore() SimpleInMemoryStore {
+	return SimpleInMemoryStore{
+		NewInMemoryStore[map[uint64]ast.Atom](),
+	}
+}
+
+// GetFacts implementation that looks up facts from an in-memory map.
+func (s SimpleInMemoryStore) GetFacts(a ast.Atom, fn func(ast.Atom) error) error {
+	for _, fact := range s.shardsByPredicate[a.Predicate] {
+		if Matches(a.Args, fact.Args) {
+			if err := fn(fact); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// EstimateFactCount returns the number of facts.
+func (s SimpleInMemoryStore) EstimateFactCount() int {
+	c := 0
+	for _, m := range s.shardsByPredicate {
+		c += len(m)
+	}
+	return c
+}
+
+// Add implements the FactStore interface by adding the fact to the backing map.
+func (s SimpleInMemoryStore) Add(a ast.Atom) bool {
+	key := a.Hash()
+	if atoms, ok := s.shardsByPredicate[a.Predicate]; ok {
+		_, ok := atoms[key]
+		if !ok {
+			atoms[key] = a
+		}
+		return !ok
+	}
+	s.shardsByPredicate[a.Predicate] = map[uint64]ast.Atom{key: a}
+	return true
+}
+
+// Remove removes the fact from the backing map.
+func (s SimpleInMemoryStore) Remove(a ast.Atom) bool {
+	key := a.Hash()
+	if atoms, ok := s.shardsByPredicate[a.Predicate]; ok {
+		if _, ok := atoms[key]; ok {
+			delete(atoms, key)
+			if len(atoms) == 0 {
+				delete(s.shardsByPredicate, a.Predicate)
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// Contains returns true if this store contains this atom already.
+func (s SimpleInMemoryStore) Contains(a ast.Atom) bool {
+	key := a.Hash()
+	if atoms, ok := s.shardsByPredicate[a.Predicate]; ok {
+		_, ok := atoms[key]
+		return ok
+	}
+	return false
+}
+
+// Merge adds all facts from other to this fact store.
+func (s SimpleInMemoryStore) Merge(other ReadOnlyFactStore) {
+	for _, pred := range other.ListPredicates() {
+		other.GetFacts(ast.NewQuery(pred), func(fact ast.Atom) error {
+			s.Add(fact)
+			return nil
+		})
+	}
+}
+
+// MergedStore is an implementation of FactStore that merges multiple
+// fact stores. It dispatches lookup requests to all of them but sending
+// all writes to a single one. It is advisable that the read stores are
+// disjoint, otherwise it may well happen that GetFacts will invoke the
+// callback with a fact multiple times.
+// MergedStore supports Remove for its write store.
+type MergedStore struct {
+	readStore  []ReadOnlyFactStore
+	writeStore FactStore
+}
+
+// Add implementation that adds to the write store.
+func (s MergedStore) Add(atom ast.Atom) bool {
+	if s.Contains(atom) {
+		return false
+	}
+	return s.writeStore.Add(atom)
+}
+
+// Remove implementation that removes from the write store.
+func (s MergedStore) Remove(atom ast.Atom) bool {
+	if remover, ok := s.writeStore.(FactStoreWithRemove); ok {
+		return remover.Remove(atom)
+	}
+	return false
+}
+
+// Contains implementation that checks all stores.
+func (s MergedStore) Contains(atom ast.Atom) bool {
+	for _, store := range s.readStore {
+		if store.Contains(atom) {
+			return true
+		}
+	}
+	return s.writeStore.Contains(atom)
+}
+
+// GetFacts implementation that dispatches to all stores.
+func (s MergedStore) GetFacts(query ast.Atom, cb func(ast.Atom) error) error {
+	for _, store := range s.readStore {
+		if err := store.GetFacts(query, cb); err != nil {
+			return err
+		}
+	}
+	if err := s.writeStore.GetFacts(query, cb); err != nil {
+		return err
+	}
+	return nil
+}
+
+// EstimateFactCount implements a FactStore method. The result
+// is an overestimate, because facts may be stored multiple times.
+func (s MergedStore) EstimateFactCount() int {
+	var estimatedTotal int
+	for _, store := range s.readStore {
+		estimatedTotal += store.EstimateFactCount()
+	}
+	return estimatedTotal + s.writeStore.EstimateFactCount()
+}
+
+// ListPredicates returns a merged list of predicates.
+func (s MergedStore) ListPredicates() []ast.PredicateSym {
+	m := make(map[ast.PredicateSym]bool)
+	for _, store := range s.readStore {
+		for _, p := range store.ListPredicates() {
+			m[p] = true
+		}
+	}
+	for _, p := range s.writeStore.ListPredicates() {
+		m[p] = true
+	}
+	res := make([]ast.PredicateSym, 0, len(m))
+	for p := range m {
+		res = append(res, p)
+	}
+	return res
+}
+
+// Merge forwards to writeStore.Merge
+func (s MergedStore) Merge(other ReadOnlyFactStore) {
+	s.writeStore.Merge(other)
+}
+
+// NewMergedStore returns a new MergedStore.
+func NewMergedStore[T ReadOnlyFactStore](readStores []T, writeStore FactStore) FactStore {
+	if len(readStores) == 0 {
+		return writeStore
+	}
+	var readOnlyStores []ReadOnlyFactStore
+	for _, store := range readStores {
+		readOnlyStores = append(readOnlyStores, store)
+	}
+	return MergedStore{readOnlyStores, writeStore}
+}
+
+// Ensure that MergedStore implements the FactStore interface.
+var _ FactStore = MergedStore{nil, NewSimpleInMemoryStore()}
+
+// TeeingStore is an implementation of FactStore that directs all writes to
+// an output store, while distributing reads over a read-only base store and
+// the output store.
+type TeeingStore struct {
+	base FactStore
+	Out  FactStoreWithRemove
+}
+
+// Ensure that TeeingStore implements the FactStore interface.
+var _ FactStoreWithRemove = TeeingStore{NewSimpleInMemoryStore(), NewSimpleInMemoryStore()}
+
+// Add implementation that adds to the output store.
+func (s TeeingStore) Add(atom ast.Atom) bool {
+	if s.base.Contains(atom) {
+		return true
+	}
+	return s.Out.Add(atom)
+}
+
+// Remove implementation that removes from output store.
+func (s TeeingStore) Remove(atom ast.Atom) bool {
+	return s.Out.Remove(atom)
+}
+
+// Contains implementation that checks both stores.
+func (s TeeingStore) Contains(atom ast.Atom) bool {
+	return s.base.Contains(atom) || s.Out.Contains(atom)
+}
+
+// GetFacts implementation that queries both stores.
+func (s TeeingStore) GetFacts(query ast.Atom, cb func(ast.Atom) error) error {
+	if err := s.base.GetFacts(query, cb); err != nil {
+		return err
+	}
+	if err := s.Out.GetFacts(query, cb); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Merge implementation that adds to the output store.
+func (s TeeingStore) Merge(other ReadOnlyFactStore) {
+	s.Out.Merge(other)
+}
+
+// ListPredicates returns a list of predicates.
+func (s TeeingStore) ListPredicates() []ast.PredicateSym {
+	m := make(map[string]ast.PredicateSym)
+	for _, pred := range s.base.ListPredicates() {
+		m[pred.Symbol] = pred
+	}
+	for _, pred := range s.Out.ListPredicates() {
+		m[pred.Symbol] = pred
+	}
+	res := make([]ast.PredicateSym, 0, len(m))
+	for _, pred := range m {
+		res = append(res, pred)
+	}
+	return res
+}
+
+// EstimateFactCount returns the number of facts. The real number can be lower in case of duplicates.
+func (s TeeingStore) EstimateFactCount() int {
+	return s.base.EstimateFactCount() + s.Out.EstimateFactCount()
+}
+
+// NewTeeingStore returns a new TeeingStore.
+func NewTeeingStore(base FactStore) TeeingStore {
+	return TeeingStore{base, NewMultiIndexedArrayInMemoryStore()}
+}
+
+// Matches matches a list of patterns against a list of base terms.
+func Matches(pattern []ast.BaseTerm, args []ast.BaseTerm) bool {
+	for i, t := range pattern {
+		if _, ok := t.(ast.Constant); ok && !t.Equals(args[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// IndexedInMemoryStore provides a simple implementation backed by a three-level map.
+// For each predicate sym, we have a separate map, using hash of the first argument and then
+// hash of the entire atom.
+type IndexedInMemoryStore struct {
+	InMemoryStore[map[uint64]map[uint64]ast.Atom]
+}
+
+// NewIndexedInMemoryStore constructs a new IndexedInMemoryStore.
+func NewIndexedInMemoryStore() IndexedInMemoryStore {
+	return IndexedInMemoryStore{
+		NewInMemoryStore[map[uint64]map[uint64]ast.Atom](),
+	}
+}
+
+func (s IndexedInMemoryStore) getFactsOfFirstVariable(a ast.Atom, fn func(ast.Atom) error) error {
+	for _, shard := range s.shardsByPredicate[a.Predicate] {
+		for _, fact := range shard {
+			if Matches(a.Args[1:], fact.Args[1:]) {
+				if err := fn(fact); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// GetFacts implementation that looks up facts from an in-memory map.
+func (s IndexedInMemoryStore) GetFacts(a ast.Atom, fn func(ast.Atom) error) error {
+	if a.Predicate.Arity == 0 {
+		if a, ok := s.constants[a.Predicate]; ok {
+			return fn(a)
+		}
+		return nil
+	}
+	if _, ok := a.Args[0].(ast.Variable); ok {
+		return s.getFactsOfFirstVariable(a, fn)
+	}
+	h := a.Args[0].Hash()
+	for _, fact := range s.shardsByPredicate[a.Predicate][h] {
+		if Matches(a.Args, fact.Args) {
+			if err := fn(fact); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// Add implements the FactStore interface by adding the fact to the backing map.
+func (s IndexedInMemoryStore) Add(a ast.Atom) bool {
+	if a.Predicate.Arity == 0 {
+		_, ok := s.constants[a.Predicate]
+		if !ok {
+			s.constants[a.Predicate] = a
+			return true
+		}
+		return false
+	}
+	h := a.Args[0].Hash()
+	shard, ok := s.shardsByPredicate[a.Predicate]
+	if !ok {
+		shard = map[uint64]map[uint64]ast.Atom{h: {a.Hash(): a}}
+		s.shardsByPredicate[a.Predicate] = shard
+		return true
+	}
+	key := a.Hash()
+	atoms, ok := shard[h]
+	if !ok {
+		shard[h] = map[uint64]ast.Atom{a.Hash(): a}
+		return true
+	}
+	if _, ok := atoms[key]; !ok {
+		atoms[key] = a
+		return true
+	}
+	return false
+}
+
+// Remove removes the fact to the backing map.
+func (s IndexedInMemoryStore) Remove(a ast.Atom) bool {
+	if a.Predicate.Arity == 0 {
+		if _, ok := s.constants[a.Predicate]; ok {
+			delete(s.constants, a.Predicate)
+			return true
+		}
+		return false
+	}
+	h := a.Args[0].Hash()
+	shard, ok := s.shardsByPredicate[a.Predicate]
+	if !ok {
+		return false
+	}
+	key := a.Hash()
+	atoms, ok := shard[h]
+	if !ok {
+		return false
+	}
+	if _, ok := atoms[key]; ok {
+		delete(atoms, key)
+		return true
+	}
+	return false
+}
+
+// Contains returns true if this store contains this atom already.
+func (s IndexedInMemoryStore) Contains(a ast.Atom) bool {
+	if a.Predicate.Arity == 0 {
+		_, ok := s.constants[a.Predicate]
+		return ok
+	}
+	shard, ok := s.shardsByPredicate[a.Predicate]
+	if !ok {
+		return false
+	}
+	h := a.Args[0].Hash()
+	atoms, ok := shard[h]
+	if !ok {
+		return false
+	}
+	_, exists := atoms[a.Hash()]
+	return exists
+}
+
+// EstimateFactCount returns the number of facts.
+func (s IndexedInMemoryStore) EstimateFactCount() int {
+	c := len(s.constants)
+	for _, s := range s.shardsByPredicate {
+		for _, m := range s {
+			c += len(m)
+		}
+	}
+	return c
+}
+
+// Merge adds all facts from other to this fact store.
+func (s IndexedInMemoryStore) Merge(other ReadOnlyFactStore) {
+	for _, pred := range other.ListPredicates() {
+		other.GetFacts(ast.NewQuery(pred), func(fact ast.Atom) error {
+			s.Add(fact)
+			return nil
+		})
+	}
+}
+
+// ListPredicates returns a list of predicates.
+func (s IndexedInMemoryStore) ListPredicates() []ast.PredicateSym {
+	var r []ast.PredicateSym
+	for p := range s.constants {
+		r = append(r, p)
+	}
+	for p := range s.shardsByPredicate {
+		r = append(r, p)
+	}
+	return r
+}
+
+// MultiIndexedInMemoryStore provides a simple implementation backed by a four-level map.
+// For each predicate sym, we have a separate map, using the index and the hash of the nth argument
+// and then hash of the entire atom.
+type MultiIndexedInMemoryStore struct {
+	InMemoryStore[map[uint16]map[uint64]map[uint64]*ast.Atom]
+}
+
+// NewMultiIndexedInMemoryStore constructs a new MultiIndexedInMemoryStore.
+func NewMultiIndexedInMemoryStore() MultiIndexedInMemoryStore {
+	return MultiIndexedInMemoryStore{
+		NewInMemoryStore[map[uint16]map[uint64]map[uint64]*ast.Atom](),
+	}
+}
+
+func (s MultiIndexedInMemoryStore) getFactsOfFirstVariable(a ast.Atom, fn func(ast.Atom) error) error {
+	for _, shard := range s.shardsByPredicate[a.Predicate][0] {
+		for _, fact := range shard {
+			if Matches(a.Args[1:], fact.Args[1:]) {
+				if err := fn(*fact); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// GetFacts implementation that looks up facts from an in-memory map.
+func (s MultiIndexedInMemoryStore) GetFacts(a ast.Atom, fn func(ast.Atom) error) error {
+	if a.Predicate.Arity == 0 {
+		if a, ok := s.constants[a.Predicate]; ok {
+			return fn(a)
+		}
+		return nil
+	}
+	for i := 0; i < a.Predicate.Arity; i++ {
+		// Find a non variable parameter.
+		if _, ok := a.Args[i].(ast.Variable); !ok {
+			h := a.Args[i].Hash()
+			for _, fact := range s.shardsByPredicate[a.Predicate][uint16(i)][h] {
+				if Matches(a.Args, fact.Args) {
+					if err := fn(*fact); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		}
+	}
+	return s.getFactsOfFirstVariable(a, fn)
+}
+
+// Add implements the FactStore interface by adding the fact to the backing map.
+func (s MultiIndexedInMemoryStore) Add(a ast.Atom) bool {
+	if a.Predicate.Arity == 0 {
+		_, ok := s.constants[a.Predicate]
+		if !ok {
+			s.constants[a.Predicate] = a
+			return true
+		}
+		return false
+	}
+	aHash := a.Hash()
+	shard, ok := s.shardsByPredicate[a.Predicate]
+	if !ok {
+		shard = make(map[uint16]map[uint64]map[uint64]*ast.Atom)
+		s.shardsByPredicate[a.Predicate] = shard
+		for i := 0; i < a.Predicate.Arity; i++ {
+			iHash := a.Args[i].Hash()
+			shard[uint16(i)] = map[uint64]map[uint64]*ast.Atom{iHash: {aHash: &a}}
+		}
+		return true
+	}
+	added := false
+	for i := 0; i < a.Predicate.Arity; i++ {
+		iHash := a.Args[i].Hash()
+		params, ok := shard[uint16(i)]
+		if !ok {
+			shard[uint16(i)] = map[uint64]map[uint64]*ast.Atom{iHash: {aHash: &a}}
+			added = true
+			continue
+		}
+		atoms, ok := params[iHash]
+		if !ok {
+			params[iHash] = map[uint64]*ast.Atom{aHash: &a}
+			added = true
+		} else if _, ok := atoms[aHash]; !ok {
+			atoms[aHash] = &a
+			added = true
+		}
+	}
+	return added
+}
+
+// Remove implementation for FactStoreWithRemove.
+func (s MultiIndexedInMemoryStore) Remove(a ast.Atom) bool {
+	if a.Predicate.Arity == 0 {
+		if _, ok := s.constants[a.Predicate]; ok {
+			delete(s.constants, a.Predicate)
+			return true
+		}
+		return false
+	}
+	aHash := a.Hash()
+	shard, ok := s.shardsByPredicate[a.Predicate]
+	if !ok {
+		return false
+	}
+	removed := false
+	for i := 0; i < a.Predicate.Arity; i++ {
+		iHash := a.Args[i].Hash()
+		params, ok := shard[uint16(i)]
+		if !ok {
+			return false
+		}
+		atoms, ok := params[iHash]
+		if !ok {
+			return false
+		}
+		if _, ok := atoms[aHash]; ok {
+			delete(atoms, aHash)
+			removed = true
+		}
+	}
+	return removed
+}
+
+// Contains returns true if this store contains this atom already.
+func (s MultiIndexedInMemoryStore) Contains(a ast.Atom) bool {
+	if a.Predicate.Arity == 0 {
+		_, ok := s.constants[a.Predicate]
+		return ok
+	}
+	shard, ok := s.shardsByPredicate[a.Predicate]
+	if !ok {
+		return false
+	}
+	params, ok := shard[0]
+	if !ok {
+		return false
+	}
+	h := a.Args[0].Hash()
+	atoms, ok := params[h]
+	if !ok {
+		return false
+	}
+	_, exists := atoms[a.Hash()]
+	return exists
+}
+
+// EstimateFactCount returns the number of facts.
+func (s MultiIndexedInMemoryStore) EstimateFactCount() int {
+	c := len(s.constants)
+	for _, s := range s.shardsByPredicate {
+		for _, m := range s[0] {
+			c += len(m)
+		}
+	}
+	return c
+}
+
+// Merge adds all facts from other to this fact store.
+func (s MultiIndexedInMemoryStore) Merge(other ReadOnlyFactStore) {
+	for _, pred := range other.ListPredicates() {
+		other.GetFacts(ast.NewQuery(pred), func(fact ast.Atom) error {
+			s.Add(fact)
+			return nil
+		})
+	}
+}
+
+// ListPredicates returns a list of predicates.
+func (s MultiIndexedInMemoryStore) ListPredicates() []ast.PredicateSym {
+	var r []ast.PredicateSym
+	for p := range s.constants {
+		r = append(r, p)
+	}
+	for p := range s.shardsByPredicate {
+		r = append(r, p)
+	}
+	return r
+}
+
+// MultiIndexedArrayInMemoryStore provides a simple implementation backed by a four-level map.
+// For each predicate sym, we have a separate map, using the index and the hash of the nth argument
+// and then hash of the entire atom, with the ultimate value being an array of Atoms.
+type MultiIndexedArrayInMemoryStore struct {
+	InMemoryStore[map[uint16]map[uint64]map[uint64][]*ast.Atom]
+	count int
+}
+
+var _ FactStoreWithRemove = NewMultiIndexedInMemoryStore()
+
+// NewMultiIndexedArrayInMemoryStore constructs a new MultiIndexedArrayInMemoryStore.
+func NewMultiIndexedArrayInMemoryStore() *MultiIndexedArrayInMemoryStore {
+	return &MultiIndexedArrayInMemoryStore{
+		InMemoryStore: NewInMemoryStore[map[uint16]map[uint64]map[uint64][]*ast.Atom](),
+		count:         0,
+	}
+}
+
+func (s *MultiIndexedArrayInMemoryStore) getFactsOfFirstVariable(a ast.Atom, fn func(ast.Atom) error) error {
+	for _, shard := range s.shardsByPredicate[a.Predicate][0] {
+		for _, facts := range shard {
+			for _, fact := range facts {
+				if Matches(a.Args, fact.Args) {
+					if err := fn(*fact); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// GetFacts implementation that looks up facts from an in-memory map.
+func (s *MultiIndexedArrayInMemoryStore) GetFacts(a ast.Atom, fn func(ast.Atom) error) error {
+	if a.Predicate.Arity == 0 {
+		if a, ok := s.constants[a.Predicate]; ok {
+			return fn(a)
+		}
+		return nil
+	}
+	for i := 0; i < a.Predicate.Arity; i++ {
+		// Find a non variable parameter.
+		if _, ok := a.Args[i].(ast.Variable); !ok {
+			h := a.Args[i].Hash()
+			for _, facts := range s.shardsByPredicate[a.Predicate][uint16(i)][h] {
+				for _, fact := range facts {
+					if Matches(a.Args, fact.Args) {
+						if err := fn(*fact); err != nil {
+							return err
+						}
+					}
+				}
+			}
+			return nil
+		}
+	}
+	return s.getFactsOfFirstVariable(a, fn)
+}
+
+// Add implements the FactStore interface by adding the fact to the backing map.
+func (s *MultiIndexedArrayInMemoryStore) Add(a ast.Atom) bool {
+	added := s.addAtom(a)
+	if added {
+		s.count++
+	}
+	return added
+}
+
+// Remove removes the fact from the backing map.
+func (s *MultiIndexedArrayInMemoryStore) Remove(a ast.Atom) bool {
+	removed := s.removeAtom(a)
+	if removed {
+		s.count--
+	}
+	return removed
+}
+
+func (s *MultiIndexedArrayInMemoryStore) addAtom(a ast.Atom) bool {
+	if a.Predicate.Arity == 0 {
+		_, ok := s.constants[a.Predicate]
+		if !ok {
+			s.constants[a.Predicate] = a
+			return true
+		}
+		return false
+	}
+	aHash := a.Hash()
+	shard, ok := s.shardsByPredicate[a.Predicate]
+	if !ok {
+		shard = make(map[uint16]map[uint64]map[uint64][]*ast.Atom)
+		s.shardsByPredicate[a.Predicate] = shard
+		for i := 0; i < a.Predicate.Arity; i++ {
+			shard[uint16(i)] = make(map[uint64]map[uint64][]*ast.Atom)
+			iHash := a.Args[i].Hash()
+			shard[uint16(i)][iHash] = make(map[uint64][]*ast.Atom)
+			shard[uint16(i)][iHash][aHash] = append(shard[uint16(i)][iHash][aHash], &a)
+		}
+		return true
+	}
+	added := false
+nextArg:
+	for i := 0; i < a.Predicate.Arity; i++ {
+		iHash := a.Args[i].Hash()
+		params, ok := shard[uint16(i)]
+		if !ok {
+			shard[uint16(i)] = make(map[uint64]map[uint64][]*ast.Atom)
+			shard[uint16(i)][iHash] = make(map[uint64][]*ast.Atom)
+			shard[uint16(i)][iHash][aHash] = append(shard[uint16(i)][iHash][aHash], &a)
+			added = true
+			continue
+		}
+		atoms, ok := params[iHash]
+		if !ok {
+			params[iHash] = make(map[uint64][]*ast.Atom)
+			params[iHash][aHash] = append(params[iHash][aHash], &a)
+			added = true
+		} else {
+			aList, ok := atoms[aHash]
+			if !ok {
+				atoms[aHash] = []*ast.Atom{&a}
+				added = true
+				continue
+			}
+			for _, atom := range aList {
+				if a.Equals(*atom) {
+					continue nextArg
+				}
+			}
+			atoms[aHash] = append(atoms[aHash], &a)
+			added = true
+		}
+	}
+	return added
+}
+
+func (s *MultiIndexedArrayInMemoryStore) removeAtom(a ast.Atom) bool {
+	if a.Predicate.Arity == 0 {
+		if _, ok := s.constants[a.Predicate]; ok {
+			delete(s.constants, a.Predicate)
+			return true
+		}
+		return false
+	}
+	aHash := a.Hash()
+	shard, ok := s.shardsByPredicate[a.Predicate]
+	if !ok {
+		return false
+	}
+	removed := false
+	for i := 0; i < a.Predicate.Arity; i++ {
+		iHash := a.Args[i].Hash()
+		params, ok := shard[uint16(i)]
+		if !ok {
+			continue
+		}
+		atoms, ok := params[iHash]
+		if !ok {
+			continue
+		}
+		if _, ok := atoms[aHash]; ok {
+			for j, atom := range atoms[aHash] {
+				if a.Equals(*atom) {
+					atoms[aHash] = append(atoms[aHash][:j], atoms[aHash][j+1:]...)
+					removed = true
+					break
+				}
+			}
+		}
+	}
+	return removed
+}
+
+// Contains returns true if this store contains this atom already.
+func (s *MultiIndexedArrayInMemoryStore) Contains(a ast.Atom) bool {
+	if a.Predicate.Arity == 0 {
+		_, ok := s.constants[a.Predicate]
+		return ok
+	}
+	shard, ok := s.shardsByPredicate[a.Predicate]
+	if !ok {
+		return false
+	}
+	params, ok := shard[0]
+	if !ok {
+		return false
+	}
+	h := a.Args[0].Hash()
+	atoms, ok := params[h]
+	if !ok {
+		return false
+	}
+	for _, fact := range atoms[a.Hash()] {
+		if a.Equals(*fact) {
+			return true
+		}
+	}
+	return false
+}
+
+// EstimateFactCount returns the number of facts.
+func (s *MultiIndexedArrayInMemoryStore) EstimateFactCount() int {
+	return s.count
+}
+
+// Merge adds all facts from other to this fact store.
+func (s *MultiIndexedArrayInMemoryStore) Merge(other ReadOnlyFactStore) {
+	for _, pred := range other.ListPredicates() {
+		other.GetFacts(ast.NewQuery(pred), func(fact ast.Atom) error {
+			s.Add(fact)
+			return nil
+		})
+	}
+}
+
+// ListPredicates returns a list of predicates.
+func (s *MultiIndexedArrayInMemoryStore) ListPredicates() []ast.PredicateSym {
+	var r []ast.PredicateSym
+	for p := range s.constants {
+		r = append(r, p)
+	}
+	for p := range s.shardsByPredicate {
+		r = append(r, p)
+	}
+	return r
+}
+
+// ConcurrentFactStore is an implementation of FactStore that allows multiple concurrent
+// operations on it. The operations are protected by a read-write lock so multiple read
+// operations like Contains or GetFacts can run concurrently, but only one write
+// operation like Add or Merge can run at a time. Also, read operations block on running
+// write operations.
+// ConcurrentFactStore forwards all its operations to an underlying base FactStore.
+type ConcurrentFactStore struct {
+	mutex *sync.RWMutex
+	base  FactStoreWithRemove
+}
+
+// Ensure that ConcurrentFactStore implements the FactStore interface.
+var _ FactStore = NewConcurrentFactStore(NewSimpleInMemoryStore())
+
+// Add implementation that adds to the base store after acquiring a write lock.
+func (s ConcurrentFactStore) Add(a ast.Atom) bool {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	return s.base.Add(a)
+}
+
+// Remove implementation that removes from the base store after acquiring a write lock.
+func (s ConcurrentFactStore) Remove(a ast.Atom) bool {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	return s.base.Remove(a)
+}
+
+// Contains implementation that checks base store after acquiring a read lock.
+func (s ConcurrentFactStore) Contains(a ast.Atom) bool {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.base.Contains(a)
+}
+
+// GetFacts implementation that queries the base store after acquiring a read lock.
+func (s ConcurrentFactStore) GetFacts(a ast.Atom, fn func(ast.Atom) error) error {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.base.GetFacts(a, fn)
+}
+
+// Merge implementation that adds to the base store after acquiring a write lock.
+func (s ConcurrentFactStore) Merge(other ReadOnlyFactStore) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.base.Merge(other)
+}
+
+// ListPredicates returns a list of predicates in the base store after acquiring a read lock.
+func (s ConcurrentFactStore) ListPredicates() []ast.PredicateSym {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.base.ListPredicates()
+}
+
+// EstimateFactCount returns the number of facts in the base store after acquiring a read lock.
+func (s ConcurrentFactStore) EstimateFactCount() int {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.base.EstimateFactCount()
+}
+
+// NewConcurrentFactStore returns a new ConcurrentFactStore that wraps the given FactStore.
+func NewConcurrentFactStore(base FactStoreWithRemove) ConcurrentFactStore {
+	return ConcurrentFactStore{&sync.RWMutex{}, base}
+}
