@@ -58,6 +58,8 @@ type engine struct {
 	predToDecl         map[ast.PredicateSym]*ast.Decl
 	stats              Stats
 	options            EvalOptions
+	stratum            int
+	iteration          int
 }
 
 // ExternalPredicateCallback is used to query external data sources.
@@ -317,6 +319,7 @@ func (e *engine) evalStrata() error {
 			predToDecl:         e.predToDecl,
 			stats:              e.stats,
 			options:            e.options,
+			stratum:            i,
 		}
 		if err := e.eval(); err != nil {
 			return err
@@ -513,6 +516,7 @@ func (e *engine) mergeDelta() error {
 func (e *engine) eval() error {
 	predicateAllowList := *e.options.predicateAllowList
 	// First round.
+	e.iteration = 0
 	for _, clause := range e.programInfo.Rules {
 		if !predicateAllowList(clause.Head.Predicate) {
 			continue
@@ -563,6 +567,7 @@ func (e *engine) eval() error {
 			return err
 		}
 		for {
+			e.iteration++
 			newDeltaStore := factstore.NewMultiIndexedArrayInMemoryStore()
 			var newTemporalDeltaStore factstore.TemporalFactStore
 			if e.temporalStore != nil {
@@ -647,7 +652,15 @@ func (e *engine) eval() error {
 					return false
 				}
 				if e.options.recorder != nil && kind == TransformKindDo {
-					e.options.recorder.DoEmit(clause, clause.Head, groupKey, groupFacts, a)
+					e.options.recorder.DoEmit(DoEmission{
+						Rule:          clause,
+						Head:          clause.Head,
+						GroupKey:      groupKey,
+						InputFacts:    groupFacts,
+						Output:        a,
+						Stratum:       e.stratum,
+						TransformText: clause.Transform.String(),
+					})
 				}
 				return e.store.Add(a)
 			}); err != nil {
@@ -660,38 +673,136 @@ func (e *engine) eval() error {
 	return nil
 }
 
-// resolvePremiseFacts re-evaluates each atom-shaped premise under the given
-// substitution, returning the ground atom that matched. Delta-prefixed
-// predicates (introduced by semi-naive evaluation) are normalized back to
-// their original predicate. The returned slice has one entry per premise;
-// non-atom premises (Eq, Ineq, NegAtom) produce a zero-valued Atom. Used
-// only when a [DerivationRecorder] is configured.
-func (e *engine) resolvePremiseFacts(premises []ast.Term, sol unionfind.UnionFind) []ast.Atom {
-	out := make([]ast.Atom, len(premises))
+// describePremises re-evaluates each premise under the given substitution
+// to produce a [PremiseRef] per body position. It classifies premises into
+// subgoals, built-ins, negations and temporal literals, and attaches the
+// validity interval of matched temporal facts. Delta-prefixed predicates
+// (introduced by semi-naive evaluation) are normalized back to their
+// original predicate. Used only when a [DerivationRecorder] is configured.
+func (e *engine) describePremises(premises []ast.Term, sol unionfind.UnionFind) []PremiseRef {
+	out := make([]PremiseRef, len(premises))
 	for i, p := range premises {
-		var atom ast.Atom
+		ref := PremiseRef{Index: i}
 		switch t := p.(type) {
 		case ast.Atom:
-			atom = t
-		case ast.TemporalLiteral:
-			a, ok := t.Literal.(ast.Atom)
-			if !ok {
+			atom := t
+			if isDeltaPredicate(atom.Predicate) {
+				atom = makeNormalAtom(atom)
+			}
+			if atom.Predicate.IsBuiltin() {
+				ref.Kind = PremiseBuiltin
+				ref.Literal = atom.String()
+				out[i] = ref
 				continue
 			}
-			atom = a
+			ground, err := functional.EvalAtom(atom, sol)
+			if err != nil {
+				out[i] = ref
+				continue
+			}
+			ref.Kind = PremiseAtom
+			ref.Atom = ground
+			out[i] = ref
+		case ast.NegAtom:
+			ground, err := functional.EvalAtom(t.Atom, sol)
+			if err != nil {
+				out[i] = ref
+				continue
+			}
+			if ground.Predicate.IsBuiltin() {
+				ref.Kind = PremiseBuiltin
+				ref.Literal = t.String()
+				out[i] = ref
+				continue
+			}
+			ref.Kind = PremiseNegation
+			ref.Predicate = ground
+			out[i] = ref
+		case ast.Eq, ast.Ineq:
+			ref.Kind = PremiseBuiltin
+			ref.Literal = t.String()
+			out[i] = ref
+		case ast.TemporalLiteral:
+			atom, ok := t.Literal.(ast.Atom)
+			if !ok {
+				out[i] = ref
+				continue
+			}
+			if isDeltaPredicate(atom.Predicate) {
+				atom = makeNormalAtom(atom)
+			}
+			ground, err := functional.EvalAtom(atom, sol)
+			if err != nil {
+				out[i] = ref
+				continue
+			}
+			ref.Kind = PremiseTemporal
+			ref.Temporal = true
+			ref.Atom = ground
+			if e.temporalStore != nil {
+				if iv := e.lookupInterval(ground, sol, t.Interval); iv != nil {
+					ref.Interval = iv
+				}
+			}
+			out[i] = ref
 		default:
-			continue
+			ref.Kind = PremiseBuiltin
+			ref.Literal = p.String()
+			out[i] = ref
 		}
-		if isDeltaPredicate(atom.Predicate) {
-			atom = makeNormalAtom(atom)
-		}
-		ground, err := functional.EvalAtom(atom, sol)
-		if err != nil {
-			continue
-		}
-		out[i] = ground
 	}
 	return out
+}
+
+// lookupInterval returns the validity interval of the temporal fact that
+// matches ground under sol. When the literal bound interval variables, the
+// matching interval must agree with the bound endpoints; otherwise the
+// first stored interval of the fact is used.
+func (e *engine) lookupInterval(ground ast.Atom, sol unionfind.UnionFind, litInterval *ast.Interval) *ast.Interval {
+	var wantStart, wantEnd *int64
+	if litInterval != nil {
+		if litInterval.Start.Type == ast.VariableBound {
+			if n, ok := boundNanos(sol, litInterval.Start.Variable); ok {
+				wantStart = &n
+			}
+		}
+		if litInterval.End.Type == ast.VariableBound {
+			if n, ok := boundNanos(sol, litInterval.End.Variable); ok {
+				wantEnd = &n
+			}
+		}
+	}
+	var found *ast.Interval
+	_ = e.temporalStore.GetAllFacts(ground, func(tf factstore.TemporalFact) error {
+		if wantStart != nil && factstore.GetStartTime(tf.Interval) != *wantStart {
+			return nil
+		}
+		if wantEnd != nil && factstore.GetEndTime(tf.Interval) != *wantEnd {
+			return nil
+		}
+		iv := tf.Interval
+		found = &iv
+		return errBreak
+	})
+	return found
+}
+
+// boundNanos returns the nanosecond value of an interval endpoint variable
+// bound by the temporal evaluator (a Time or Number constant).
+func boundNanos(sol unionfind.UnionFind, v ast.Variable) (int64, bool) {
+	c, ok := sol.Get(v).(ast.Constant)
+	if !ok {
+		return 0, false
+	}
+	if c.Type == ast.TimeType {
+		n, err := c.TimeValue()
+		return n, err == nil
+	}
+	if c.Type == ast.NumberType {
+		n, err := c.NumberValue()
+		return n, err == nil
+	}
+	return 0, false
 }
 
 // normalizeRule returns a clause with any delta-prefixed premise atoms
@@ -778,8 +889,15 @@ func (e *engine) oneStepEvalClause(clause ast.Clause) ([]DerivedTemporalFact, er
 		if clause.Transform == nil {
 			if e.options.recorder != nil {
 				normal := normalizeRule(clause)
-				premiseFacts := e.resolvePremiseFacts(normal.Premises, sol)
-				e.options.recorder.RuleFired(normal, head, sol, premiseFacts)
+				e.options.recorder.RuleFired(RuleFiring{
+					Rule:         normal,
+					Head:         head,
+					HeadInterval: interval,
+					Subst:        sol,
+					Stratum:      e.stratum,
+					Iteration:    e.iteration,
+					Premises:     e.describePremises(normal.Premises, sol),
+				})
 			}
 			facts = append(facts, DerivedTemporalFact{Atom: head, Interval: interval})
 			continue
@@ -795,9 +913,26 @@ func (e *engine) oneStepEvalClause(clause ast.Clause) ([]DerivedTemporalFact, er
 				if e.options.recorder != nil {
 					switch kind {
 					case TransformKindLet:
-						e.options.recorder.LetEmit(normal, head, row, out)
+						e.options.recorder.LetEmit(LetEmission{
+							Rule:          normal,
+							Head:          head,
+							HeadInterval:  interval,
+							Row:           row,
+							Output:        out,
+							Stratum:       e.stratum,
+							Iteration:     e.iteration,
+							TransformText: normal.Transform.String(),
+						})
 					case TransformKindDo:
-						e.options.recorder.DoEmit(normal, head, groupKey, inputFacts, out)
+						e.options.recorder.DoEmit(DoEmission{
+							Rule:          normal,
+							Head:          head,
+							GroupKey:      groupKey,
+							InputFacts:    inputFacts,
+							Output:        out,
+							Stratum:       e.stratum,
+							TransformText: normal.Transform.String(),
+						})
 					}
 				}
 				facts = append(facts, DerivedTemporalFact{Atom: out, Interval: interval})

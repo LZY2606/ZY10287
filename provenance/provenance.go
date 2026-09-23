@@ -76,6 +76,17 @@ const (
 	// the sub-proofs of the facts that fed this group. The group's
 	// key values are stored in GroupKey.
 	KindDoAggregate
+	// KindSubgoal is an explicit positive subgoal lookup node. The node
+	// records which rule-occurrence requested the atom and which stored
+	// fact satisfied it; its single child proves the matched fact.
+	KindSubgoal
+	// KindBuiltin is an Eq/Ineq (or built-in predicate) check node. It is
+	// a leaf: the check has no fact premise, only the binding context of
+	// the enclosing rule occurrence.
+	KindBuiltin
+	// KindTemporal is a temporal subgoal node. Its single child proves the
+	// matched fact; the fact's validity interval is stored in Interval.
+	KindTemporal
 )
 
 // Binding records one entry of a rule's substitution σ.
@@ -109,6 +120,50 @@ type ProofNode struct {
 	// Partial is true if the proof could not be fully expanded (e.g. rule used
 	// a negated premise, a transform, or exceeded MaxDepth).
 	Partial bool
+	// Interval is the validity interval of a KindTemporal node's matched
+	// fact, or of the head of a temporally-annotated rule/let occurrence.
+	// nil for non-temporal nodes.
+	Interval *ast.Interval
+	// CheckedRelation is the ground pattern that was searched (and found
+	// absent) for a KindAbsence node. It is NOT a base fact.
+	CheckedRelation ast.Atom
+	// SnapshotID identifies the closed-world snapshot against which a
+	// KindAbsence node's CheckedRelation was verified. The id is content
+	// addressed from the stratum, iteration and the facts of the checked
+	// relation visible at that point.
+	SnapshotID string
+	// Stratum is the stratification index in which a recorded node fired.
+	// Zero for post-hoc (Explain) nodes and EDB leaves.
+	Stratum int
+	// Iteration is the fixed-point iteration in which a recorded node
+	// fired: 0 for the initial round, 1..n for semi-naive rounds. It lets
+	// the reader distinguish repeated derivations of the same fact along
+	// recursive paths. Zero for leaves and post-hoc nodes.
+	Iteration int
+	// BackEdge is true when this node closes a recursive SCC cycle: the
+	// edge from the parent to this node points back to an ancestor
+	// occurrence. Such nodes are rendered as references and are never
+	// re-expanded, which keeps recursive proofs finite.
+	BackEdge bool
+	// Inputs is the input multiset for KindDoAggregate nodes: one entry
+	// per row that fed the group, with duplicates retained. Ordinary
+	// premises use Premises instead.
+	Inputs []Edge
+}
+
+// Edge connects a proof node to a sub-proof. For ordinary premises the
+// edge index is the body position. For aggregation inputs the multiset
+// order is canonicalized and repeated rows share one edge with
+// Multiplicity > 1.
+type Edge struct {
+	// Index is the body position (premises) or the input-row position.
+	Index int
+	// To is the sub-proof node.
+	To *ProofNode
+	// Multiplicity is the number of times To appears at this position
+	// (always 1 for ordinary premises; >1 only for aggregate multiset
+	// inputs that collapse repeated identical rows onto one sub-node).
+	Multiplicity int
 }
 
 // Options tunes the explainer.
